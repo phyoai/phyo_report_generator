@@ -70,7 +70,6 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 FETCH_CACHE_TTL_SECONDS = 300
 _FETCH_CACHE = {}
 
-
 class InMemoryUpload(io.BytesIO):
     def __init__(self, data, filename="", content_type=""):
         super().__init__(data)
