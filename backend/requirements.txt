@@ -39,6 +39,7 @@ pyasn1_modules==0.4.2
 pydantic==2.12.3
 pydantic_core==2.41.4
 pyparsing==3.2.5
+pytesseract==0.3.13
 python-dotenv==1.2.1
 python-pptx==1.0.2
 requests==2.32.5
