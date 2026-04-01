@@ -1,0 +1,148 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: light;
+
+  --color-primary-50: #ecf6f2;
+  --color-primary-100: #c3e3d7;
+  --color-primary-200: #a5d6c4;
+  --color-primary-300: #7cc3a9;
+  --color-primary-400: #63b898;
+  --color-primary-500: #3ca67e;
+  --color-primary-600: #379773;
+  --color-primary-700: #2b7659;
+  --color-primary-800: #215b45;
+  --color-primary-900: #194635;
+
+  --color-secondary-50: #f7faf8;
+  --color-secondary-100: #eff4f1;
+  --color-secondary-200: #e7eeea;
+  --color-secondary-300: #dde5e0;
+  --color-secondary-400: #d0d9d3;
+  --color-secondary-500: #c3ccc6;
+  --color-secondary-600: #acb5af;
+  --color-secondary-700: #8e9691;
+  --color-secondary-800: #6f7772;
+  --color-secondary-900: #535a56;
+
+  --color-neutral-0: #ffffff;
+  --color-neutral-100: #f5f7f6;
+  --color-neutral-200: #e7ebea;
+  --color-neutral-300: #d4dbd8;
+  --color-neutral-400: #b4bcb9;
+  --color-neutral-500: #8e9794;
+  --color-neutral-600: #6f7775;
+  --color-neutral-700: #505756;
+  --color-neutral-800: #313736;
+  --color-neutral-900: #1f2423;
+  --color-neutral-1000: #171a1a;
+  --color-neutral-1100: #101213;
+
+  --color-success-50: #eaf8ef;
+  --color-success-100: #c9edd6;
+  --color-success-200: #a8e3bd;
+  --color-success-300: #79d292;
+  --color-success-400: #59c777;
+  --color-success-500: #43ba60;
+  --color-success-600: #379e51;
+  --color-success-700: #2d8343;
+  --color-success-800: #236a36;
+  --color-success-900: #1a542b;
+
+  --color-error-50: #fdf1ee;
+  --color-error-100: #f6d4cb;
+  --color-error-200: #efb7a8;
+  --color-error-300: #e88d76;
+  --color-error-400: #e0694d;
+  --color-error-500: #d94b27;
+  --color-error-600: #ba3f20;
+  --color-error-700: #97341a;
+  --color-error-800: #772914;
+  --color-error-900: #5a1f0f;
+
+  --color-warning-50: #fff7df;
+  --color-warning-100: #ffedb3;
+  --color-warning-200: #ffe183;
+  --color-warning-300: #ffd34d;
+  --color-warning-400: #ffc61a;
+  --color-warning-500: #efb100;
+  --color-warning-600: #cc9600;
+  --color-warning-700: #a87b00;
+  --color-warning-800: #866200;
+  --color-warning-900: #664a00;
+
+  --color-info-50: #eef3ff;
+  --color-info-100: #d7e2ff;
+  --color-info-200: #b9cbff;
+  --color-info-300: #8eaaff;
+  --color-info-400: #6388ff;
+  --color-info-500: #416af5;
+  --color-info-600: #3456d4;
+  --color-info-700: #2b46ad;
+  --color-info-800: #213686;
+  --color-info-900: #192962;
+
+  --opacity-white-10: rgba(255, 255, 255, 0.1);
+  --opacity-white-16: rgba(255, 255, 255, 0.16);
+  --opacity-white-24: rgba(255, 255, 255, 0.24);
+  --opacity-white-40: rgba(255, 255, 255, 0.4);
+  --opacity-black-10: rgba(0, 0, 0, 0.1);
+  --opacity-black-16: rgba(0, 0, 0, 0.16);
+  --opacity-black-24: rgba(0, 0, 0, 0.24);
+  --opacity-black-40: rgba(0, 0, 0, 0.4);
+
+  --bg-canvas: #f7faf8;
+  --bg-canvas-2: #eef4f1;
+  --bg-elevated: rgba(255, 255, 255, 0.9);
+  --bg-panel: rgba(255, 255, 255, 0.82);
+  --bg-panel-soft: rgba(247, 250, 248, 0.92);
+  --bg-panel-strong: rgba(255, 255, 255, 0.96);
+  --bg-overlay: var(--opacity-white-40);
+
+  --border-subtle: rgba(83, 90, 86, 0.12);
+  --border-strong: rgba(83, 90, 86, 0.18);
+  --border-focus: rgba(124, 195, 169, 0.72);
+
+  --text-primary: var(--color-neutral-900);
+  --text-secondary: var(--color-neutral-700);
+  --text-muted: var(--color-neutral-600);
+  --text-faint: var(--color-neutral-500);
+
+  --brand-primary: var(--color-primary-500);
+  --brand-secondary: var(--color-primary-400);
+  --brand-tertiary: var(--color-primary-300);
+  --brand-ink: var(--color-primary-900);
+  --brand-soft: rgba(165, 214, 196, 0.16);
+  --brand-soft-strong: rgba(124, 195, 169, 0.28);
+
+  --semantic-success-bg: rgba(67, 186, 96, 0.16);
+  --semantic-success-border: rgba(89, 199, 119, 0.28);
+  --semantic-success-text: var(--color-success-100);
+  --semantic-warning-bg: rgba(255, 198, 26, 0.16);
+  --semantic-warning-border: rgba(255, 198, 26, 0.28);
+  --semantic-warning-text: var(--color-warning-100);
+  --semantic-error-bg: rgba(217, 75, 39, 0.16);
+  --semantic-error-border: rgba(217, 75, 39, 0.28);
+  --semantic-error-text: var(--color-error-100);
+  --semantic-info-bg: rgba(65, 106, 245, 0.16);
+  --semantic-info-border: rgba(65, 106, 245, 0.28);
+  --semantic-info-text: var(--color-info-100);
+
+  --shadow-soft: 0 24px 60px rgba(16, 18, 19, 0.12);
+  --shadow-focus: 0 0 0 3px rgba(124, 195, 169, 0.22);
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  background:
+    radial-gradient(circle at top left, rgba(124, 195, 169, 0.18), transparent 28%),
+    radial-gradient(circle at top right, rgba(165, 214, 196, 0.14), transparent 24%),
+    radial-gradient(circle at bottom center, rgba(236, 246, 242, 0.9), transparent 40%),
+    linear-gradient(180deg, var(--bg-canvas) 0%, var(--bg-canvas-2) 100%);
+  color: var(--text-primary);
+}

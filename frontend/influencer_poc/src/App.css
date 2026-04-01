@@ -1,0 +1,349 @@
+.report-app {
+  background:
+    linear-gradient(135deg, rgba(124, 195, 169, 0.11), transparent 26%),
+    linear-gradient(225deg, rgba(165, 214, 196, 0.06), transparent 22%);
+  position: relative;
+}
+
+.report-app::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 12% 10%, rgba(124, 195, 169, 0.16), transparent 22%),
+    radial-gradient(circle at 85% 12%, rgba(165, 214, 196, 0.22), transparent 18%),
+    radial-gradient(circle at 50% 92%, rgba(236, 246, 242, 0.9), transparent 26%);
+  opacity: 0.9;
+}
+
+.report-pattern {
+  background:
+    linear-gradient(90deg, transparent, rgba(83, 90, 86, 0.04), transparent),
+    linear-gradient(180deg, transparent, rgba(83, 90, 86, 0.03), transparent);
+  mask-image: radial-gradient(circle at center, black, transparent 92%);
+}
+
+.report-shell {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-soft);
+  position: relative;
+  overflow: hidden;
+  backdrop-filter: blur(22px);
+}
+
+.report-shell::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(135deg, rgba(165, 214, 196, 0.12), transparent 18%, transparent 82%, rgba(124, 195, 169, 0.08)),
+    radial-gradient(circle at top right, rgba(124, 195, 169, 0.14), transparent 26%);
+  opacity: 0.9;
+}
+
+.report-panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+}
+
+.report-panel-soft {
+  background: var(--bg-panel-soft);
+  border: 1px solid var(--border-subtle);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+}
+
+.report-panel-strong {
+  background: var(--bg-panel-strong);
+  border: 1px solid var(--border-strong);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+}
+
+.report-title {
+  color: var(--text-primary);
+  letter-spacing: -0.02em;
+}
+
+.report-hero {
+  position: relative;
+  text-align: center;
+}
+
+.report-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.9rem;
+  border-radius: 999px;
+  border: 1px solid rgba(124, 195, 169, 0.3);
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--brand-ink);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  box-shadow: 0 10px 30px rgba(16, 18, 19, 0.06);
+}
+
+.report-badge-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 999px;
+  background: linear-gradient(135deg, var(--brand-primary), var(--brand-tertiary));
+  box-shadow: 0 0 0 5px rgba(124, 195, 169, 0.12);
+}
+
+.report-heading {
+  max-width: 10ch;
+  margin: 1rem auto 0;
+  font-size: clamp(2.4rem, 6vw, 4.6rem);
+  line-height: 0.96;
+  font-weight: 800;
+}
+
+.report-heading-accent {
+  display: block;
+  color: var(--brand-primary);
+}
+
+.report-lead {
+  max-width: 42rem;
+  margin: 1rem auto 0;
+}
+
+.report-section {
+  position: relative;
+  padding: 1.1rem;
+  border-radius: 1.25rem;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(255, 255, 255, 0.58));
+  border: 1px solid rgba(83, 90, 86, 0.08);
+  box-shadow: 0 16px 40px rgba(16, 18, 19, 0.05);
+}
+
+.report-section-title {
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--brand-primary);
+  margin-bottom: 0.85rem;
+}
+
+.report-subtitle,
+.report-label {
+  color: var(--text-secondary);
+}
+
+.report-muted {
+  color: var(--text-muted);
+}
+
+.report-faint {
+  color: var(--text-faint);
+}
+
+.report-input {
+  background: var(--bg-panel-soft);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.85);
+  transition:
+    border-color 180ms ease,
+    box-shadow 180ms ease,
+    background 180ms ease,
+    transform 180ms ease;
+}
+
+.report-input::placeholder {
+  color: var(--text-faint);
+}
+
+.report-input:focus,
+.report-dropzone:focus-within {
+  outline: none;
+  border-color: var(--border-focus);
+  box-shadow: var(--shadow-focus);
+}
+
+.report-dropzone {
+  background: var(--bg-panel-soft);
+  border: 2px dashed var(--brand-soft-strong);
+  position: relative;
+  min-height: 8rem;
+}
+
+.report-dropzone::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(135deg, rgba(165, 214, 196, 0.14), transparent 55%);
+  opacity: 0.9;
+}
+
+.report-upload-copy {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  pointer-events: none;
+  text-align: center;
+  padding: 1rem;
+}
+
+.report-upload-icon {
+  width: 2.6rem;
+  height: 2.6rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: linear-gradient(135deg, var(--brand-tertiary), var(--brand-primary));
+  color: var(--brand-ink);
+  box-shadow: 0 10px 28px rgba(60, 166, 126, 0.18);
+}
+
+.report-upload-title {
+  color: var(--text-primary);
+  font-weight: 700;
+}
+
+.report-upload-subtitle {
+  color: var(--text-muted);
+  font-size: 0.86rem;
+}
+
+.report-chip {
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid var(--border-subtle);
+  transition:
+    transform 200ms ease,
+    border-color 200ms ease,
+    background 200ms ease,
+    box-shadow 200ms ease;
+}
+
+.report-chip:hover {
+  transform: translateY(-1px);
+  border-color: var(--brand-soft-strong);
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 12px 30px rgba(16, 18, 19, 0.08);
+}
+
+.report-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 0.75rem;
+}
+
+.report-preview-card {
+  position: relative;
+  padding: 0.35rem;
+  border-radius: 1rem;
+  background: rgba(255, 255, 255, 0.78);
+  border: 1px solid rgba(83, 90, 86, 0.08);
+  box-shadow: 0 12px 28px rgba(16, 18, 19, 0.06);
+}
+
+.report-button-primary {
+  background: linear-gradient(135deg, var(--brand-primary), var(--brand-secondary));
+  color: var(--brand-ink);
+  box-shadow: 0 16px 32px rgba(60, 166, 126, 0.24);
+}
+
+.report-button-primary:hover {
+  background: linear-gradient(135deg, var(--brand-secondary), var(--brand-tertiary));
+  box-shadow: 0 18px 34px rgba(60, 166, 126, 0.3);
+}
+
+.report-button-secondary {
+  background: rgba(255, 255, 255, 0.82);
+  border: 1px solid var(--border-strong);
+  color: var(--text-primary);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+}
+
+.report-button-secondary:hover {
+  background: rgba(255, 255, 255, 0.96);
+  border-color: var(--brand-soft-strong);
+}
+
+.report-link-button {
+  background: linear-gradient(135deg, var(--brand-primary), var(--brand-secondary));
+  color: var(--brand-ink);
+  box-shadow: 0 16px 32px rgba(60, 166, 126, 0.22);
+}
+
+.report-link-button:hover {
+  background: linear-gradient(135deg, var(--brand-secondary), var(--brand-tertiary));
+  box-shadow: 0 18px 34px rgba(60, 166, 126, 0.28);
+}
+
+.report-alert-success {
+  background: var(--semantic-success-bg);
+  border: 1px solid var(--semantic-success-border);
+  color: var(--semantic-success-text);
+}
+
+.report-alert-warning {
+  background: var(--semantic-warning-bg);
+  border: 1px solid var(--semantic-warning-border);
+  color: var(--semantic-warning-text);
+}
+
+.report-alert-danger {
+  background: var(--semantic-error-bg);
+  border: 1px solid var(--semantic-error-border);
+  color: var(--semantic-error-text);
+}
+
+.report-alert-info {
+  background: var(--semantic-info-bg);
+  border: 1px solid var(--semantic-info-border);
+  color: var(--semantic-info-text);
+}
+
+.token-primary {
+  color: var(--brand-secondary);
+}
+
+.token-primary-soft {
+  color: var(--brand-tertiary);
+}
+
+.token-info {
+  color: var(--color-info-300);
+}
+
+.token-warning {
+  color: var(--color-warning-300);
+}
+
+.token-error {
+  color: var(--color-error-300);
+}
+
+.token-accent {
+  color: var(--color-secondary-200);
+}
+
+.media-frame {
+  position: relative;
+  overflow: hidden;
+  border-radius: 0.75rem;
+}
+
+.media-frame::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border-radius: inherit;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.5);
+}
