@@ -7,7 +7,7 @@ from flask import Flask, request, jsonify, send_file, Response
 from flask_cors import CORS
 from pptx import Presentation
 from pptx.util import Inches, Pt
-from pptx.enum.text import PP_ALIGN
+from pptx.enum.text import MSO_AUTO_SIZE, PP_ALIGN
 from pptx.dml.color import RGBColor
 from anthropic import Anthropic
 import os
@@ -17,13 +17,21 @@ import json
 import mimetypes
 import re
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import copy
 import time
+import subprocess
 from dotenv import load_dotenv
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageFilter, ImageOps
 import shutil
+
+try:
+    import easyocr
+    HAS_EASYOCR = True
+except Exception:
+    easyocr = None
+    HAS_EASYOCR = False
 
 # Configure Tesseract path for Windows
 import os
@@ -65,7 +73,11 @@ else:
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_PATH = os.path.join(SCRIPT_DIR, "Campaign_Report_PyroMedia.pptx")
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, "generated_reports")
+PREVIEW_DIR = os.path.join(OUTPUT_DIR, "template_preview")
+REPORT_PREVIEW_ROOT = os.path.join(OUTPUT_DIR, "report_previews")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(PREVIEW_DIR, exist_ok=True)
+os.makedirs(REPORT_PREVIEW_ROOT, exist_ok=True)
 
 FETCH_CACHE_TTL_SECONDS = 300
 _FETCH_CACHE = {}
@@ -113,6 +125,119 @@ def _cache_get(cache_key):
 
 def _cache_set(cache_key, value):
     _FETCH_CACHE[cache_key] = (time.time(), copy.deepcopy(value))
+
+
+def _ps_quote(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _export_presentation_preview_images(pptx_path, preview_dir, image_url_builder, updated_at_key="updated_at"):
+    if not os.path.exists(pptx_path):
+        raise FileNotFoundError(f"Presentation file not found: {pptx_path}")
+
+    os.makedirs(preview_dir, exist_ok=True)
+    source_mtime = os.path.getmtime(pptx_path)
+    existing_previews = [
+        name
+        for name in os.listdir(preview_dir)
+        if re.fullmatch(r"Slide\d+\.PNG", name, re.IGNORECASE)
+    ]
+    preview_mtime = 0
+    if existing_previews:
+        preview_mtime = min(
+            os.path.getmtime(os.path.join(preview_dir, name))
+            for name in existing_previews
+        )
+
+    if existing_previews and preview_mtime >= source_mtime:
+        slide_names = sorted(existing_previews, key=lambda item: int(re.sub(r"\D", "", item)))
+        return {
+            updated_at_key: datetime.fromtimestamp(source_mtime).isoformat(),
+            "slides": [
+                {
+                    "slideNumber": index + 1,
+                    "imageUrl": image_url_builder(name, source_mtime),
+                }
+                for index, name in enumerate(slide_names)
+            ],
+        }
+
+    for name in existing_previews:
+        try:
+            os.remove(os.path.join(preview_dir, name))
+        except PermissionError:
+            print(f"[WARNING] Could not remove locked preview image: {name}")
+
+    preview_dir_ps = _ps_quote(preview_dir)
+    template_path_ps = _ps_quote(pptx_path)
+    export_script = f"""
+$ErrorActionPreference = 'Stop'
+$powerpoint = New-Object -ComObject PowerPoint.Application
+$presentation = $null
+try {{
+  $presentation = $powerpoint.Presentations.Open({template_path_ps}, $false, $false, $false)
+  $presentation.Export({preview_dir_ps}, 'PNG')
+}} finally {{
+  if ($presentation -ne $null) {{
+    $presentation.Close()
+  }}
+  $powerpoint.Quit()
+}}
+"""
+    subprocess.run(
+        ["powershell", "-NoProfile", "-Command", export_script],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    slide_images = sorted(
+        [
+            name
+            for name in os.listdir(preview_dir)
+            if re.fullmatch(r"Slide\d+\.PNG", name, re.IGNORECASE)
+        ],
+        key=lambda item: int(re.sub(r"\D", "", item)),
+    )
+
+    return {
+        updated_at_key: datetime.fromtimestamp(source_mtime).isoformat(),
+        "slides": [
+            {
+                "slideNumber": index + 1,
+                "imageUrl": image_url_builder(name, source_mtime),
+            }
+            for index, name in enumerate(slide_images)
+        ],
+    }
+
+
+def export_template_preview_images():
+    """Export the local PPT template to PNG slide previews for browser viewing."""
+    return _export_presentation_preview_images(
+        TEMPLATE_PATH,
+        PREVIEW_DIR,
+        lambda name, mtime: f"/api/template-preview/image/{name}?v={int(mtime)}",
+        updated_at_key="template_updated_at",
+    )
+
+
+def export_report_preview_images(filename):
+    """Export a generated PPTX report to PNG previews for browser viewing."""
+    safe_name = os.path.basename(filename)
+    if safe_name != filename or not safe_name.lower().endswith(".pptx"):
+        raise ValueError("Invalid report filename")
+
+    pptx_path = os.path.join(OUTPUT_DIR, safe_name)
+    report_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(safe_name)[0]).strip("._") or "report"
+    report_preview_dir = os.path.join(REPORT_PREVIEW_ROOT, report_key)
+    return _export_presentation_preview_images(
+        pptx_path,
+        report_preview_dir,
+        lambda name, mtime: f"/api/report-preview/image/{report_key}/{name}?v={int(mtime)}",
+        updated_at_key="report_updated_at",
+    )
 
 
 OPENROUTER_PROMPT_TEMPLATES = {
@@ -343,8 +468,45 @@ def extract_metrics_from_image_ocr(image_file):
         # Convert to PIL Image
         img = Image.open(io.BytesIO(image_bytes))
 
-        # Run Tesseract OCR
-        extracted_text = pytesseract.image_to_string(img)
+        def _image_variants(base_image):
+            variants = []
+            rgb = base_image.convert("RGB")
+            gray = ImageOps.grayscale(rgb)
+            enlarged = gray.resize((gray.width * 2, gray.height * 2), Image.Resampling.LANCZOS)
+            high_contrast = ImageOps.autocontrast(enlarged)
+            threshold = high_contrast.point(lambda x: 255 if x > 160 else 0)
+            sharpened = high_contrast.filter(ImageFilter.SHARPEN)
+            variants.extend([rgb, gray, high_contrast, threshold, sharpened])
+            return variants
+
+        extracted_chunks = []
+        for variant in _image_variants(img):
+            try:
+                extracted_chunks.append(
+                    pytesseract.image_to_string(
+                        variant,
+                        config="--oem 3 --psm 6"
+                    )
+                )
+                extracted_chunks.append(
+                    pytesseract.image_to_string(
+                        variant,
+                        config="--oem 3 --psm 11"
+                    )
+                )
+            except Exception:
+                continue
+
+        if HAS_EASYOCR:
+            try:
+                reader = easyocr.Reader(['en'], gpu=False)
+                easyocr_text = reader.readtext(image_bytes, detail=0, paragraph=True)
+                if easyocr_text:
+                    extracted_chunks.append("\n".join(easyocr_text))
+            except Exception as easyocr_error:
+                print(f"[WARNING] EasyOCR failed: {easyocr_error}")
+
+        extracted_text = "\n".join(chunk for chunk in extracted_chunks if chunk).strip()
 
         print(f"[NOTE] OCR extracted text (first 300 chars):\n{extracted_text[:300]}...\n")
 
@@ -370,6 +532,49 @@ def extract_metrics_from_images_ocr(images):
                 if value and value != "N/A" and not merged_metrics.get(key):
                     merged_metrics[key] = value
     return merged_metrics
+
+
+def build_remote_media_uploads(instagram_post=None):
+    uploads = []
+    if not instagram_post:
+        return uploads
+
+    media_urls = []
+    for key in ["postImage", "videoUrl"]:
+        value = instagram_post.get(key)
+        if value and value not in media_urls:
+            media_urls.append(value)
+
+    for index, media_url in enumerate(media_urls):
+        try:
+            import requests
+
+            response = requests.get(
+                media_url,
+                timeout=30,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/123.0.0.0 Safari/537.36"
+                    )
+                },
+            )
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "") or "image/jpeg"
+            if not content_type.startswith("image/"):
+                continue
+            uploads.append(
+                InMemoryUpload(
+                    response.content,
+                    filename=f"rapidapi_media_{index + 1}.jpg",
+                    content_type=content_type,
+                )
+            )
+        except Exception as e:
+            print(f"[WARNING] Could not download RapidAPI media for OCR fallback: {e}")
+
+    return uploads
 
 
 def fetch_youtube_metrics(url_or_text):
@@ -889,6 +1094,10 @@ def validate_and_clean_data(data):
         # Convert None to empty string
         if cleaned_data[key] is None:
             cleaned_data[key] = ""
+
+    cleaned_brand = _select_unique_brand_name([cleaned_data.get("brand")])
+    if cleaned_brand:
+        cleaned_data["brand"] = cleaned_brand
 
     return cleaned_data
 
@@ -1468,28 +1677,61 @@ def populate_powerpoint(data, images):
                 print(f"[WARNING] Could not read uploaded image: {e}")
                 return None
 
+        def _fit_image_within_box(img_stream, box):
+            try:
+                img_stream.seek(0)
+                with Image.open(img_stream) as img:
+                    img_width, img_height = img.size
+                box_width = box['width']
+                box_height = box['height']
+                if not img_width or not img_height or not box_width or not box_height:
+                    return box['left'], box['top'], box_width, box_height
+
+                image_ratio = img_width / img_height
+                box_ratio = box_width / box_height
+
+                if image_ratio > box_ratio:
+                    target_width = box_width
+                    target_height = int(box_width / image_ratio)
+                    target_left = box['left']
+                    target_top = box['top'] + int((box_height - target_height) / 2)
+                else:
+                    target_height = box_height
+                    target_width = int(box_height * image_ratio)
+                    target_top = box['top']
+                    target_left = box['left'] + int((box_width - target_width) / 2)
+
+                return target_left, target_top, target_width, target_height
+            except Exception as e:
+                print(f"[WARNING] Could not calculate image fit: {e}")
+                return box['left'], box['top'], box['width'], box['height']
+
         def _add_picture_with_fallback(slide, img_stream, placeholder=None, default_box=None, rotation=0):
             if not img_stream:
                 return False
             try:
                 img_stream.seek(0)
                 if placeholder:
+                    target_left, target_top, target_width, target_height = _fit_image_within_box(img_stream, placeholder)
+                    img_stream.seek(0)
                     picture = slide.shapes.add_picture(
                         img_stream,
-                        placeholder['left'],
-                        placeholder['top'],
-                        width=placeholder['width'],
-                        height=placeholder['height']
+                        target_left,
+                        target_top,
+                        width=target_width,
+                        height=target_height
                     )
                     picture.rotation = rotation or placeholder.get('rotation', 0)
                     return True
                 if default_box:
+                    target_left, target_top, target_width, target_height = _fit_image_within_box(img_stream, default_box)
+                    img_stream.seek(0)
                     picture = slide.shapes.add_picture(
                         img_stream,
-                        default_box['left'],
-                        default_box['top'],
-                        width=default_box['width'],
-                        height=default_box['height']
+                        target_left,
+                        target_top,
+                        width=target_width,
+                        height=target_height
                     )
                     picture.rotation = default_box.get('rotation', 0)
                     return True
@@ -1507,6 +1749,366 @@ def populate_powerpoint(data, images):
                     return value
                 return value
             return ""
+
+        def _clean_text(value):
+            if value is None:
+                return ""
+            return re.sub(r"\s+", " ", str(value)).strip()
+
+        def _has_value(value):
+            cleaned = _clean_text(value)
+            return cleaned not in ("", "0", "0.0", "None", "N/A", "NA", "-")
+
+        def _clip_text(value, limit=120):
+            cleaned = _clean_text(value)
+            if len(cleaned) <= limit:
+                return cleaned
+            shortened = cleaned[: limit - 1].rsplit(" ", 1)[0].strip()
+            return f"{shortened or cleaned[: limit - 1].strip()}…"
+
+        def _display_value(value, fallback="Not available"):
+            cleaned = _clean_text(value)
+            return cleaned if cleaned else fallback
+
+        def _summarize_sentences(value, sentence_limit=2, char_limit=220):
+            cleaned = _clean_text(value)
+            if not cleaned:
+                return ""
+            sentences = re.split(r"(?<=[.!?])\s+", cleaned)
+            summary = " ".join(s.strip() for s in sentences if s.strip()) if sentences else cleaned
+            if sentences:
+                summary = " ".join(s.strip() for s in sentences[:sentence_limit] if s.strip())
+            return _clip_text(summary, char_limit)
+
+        def _prepare_text_frame(text_frame):
+            text_frame.clear()
+            text_frame.word_wrap = True
+            text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+
+        def _pick_title_font_size(text, large=53, medium=44, compact=36, minimum=28):
+            length = len(_clean_text(text))
+            if length <= 24:
+                return Pt(large)
+            if length <= 42:
+                return Pt(medium)
+            if length <= 68:
+                return Pt(compact)
+            return Pt(minimum)
+
+        def _style_paragraph(paragraph, alignment=None, line_spacing=1.0, space_after=Pt(2)):
+            if alignment is not None:
+                paragraph.alignment = alignment
+            paragraph.line_spacing = line_spacing
+            paragraph.space_after = space_after
+            paragraph.space_before = Pt(0)
+
+        def _set_title_text(shape, text, *, align=PP_ALIGN.CENTER, italic=False):
+            if not hasattr(shape, 'text_frame'):
+                shape.text = _clip_text(text, 90)
+                return
+            text_frame = shape.text_frame
+            _prepare_text_frame(text_frame)
+            p = text_frame.paragraphs[0]
+            p.text = _clip_text(text, 90)
+            _style_paragraph(p, alignment=align, line_spacing=0.95, space_after=Pt(0))
+            for run in p.runs:
+                run.font.name = 'YouTube Sans'
+                run.font.size = _pick_title_font_size(text)
+                run.font.bold = True
+                run.font.italic = italic
+                run.font.color.rgb = RGBColor(0x2B, 0x3E, 0x5C)
+
+        def _replace_with_title_box(slide, target_shape, text, *, align=PP_ALIGN.LEFT, italic=True):
+            left = getattr(target_shape, 'left', 700000)
+            top = getattr(target_shape, 'top', 650000)
+            width = getattr(target_shape, 'width', 3000000)
+            height = min(getattr(target_shape, 'height', 900000), 950000)
+
+            try:
+                sp = target_shape.element
+                sp.getparent().remove(sp)
+            except Exception:
+                pass
+
+            title_box = slide.shapes.add_textbox(left, top, width, height)
+            _set_title_text(title_box, text, align=align, italic=italic)
+            return title_box
+
+        def _set_textbox_text(slide, left, top, width, height, text, *, font_name='YouTube Sans', font_size=30, bold=True, italic=False, color=(0x2B, 0x3E, 0x5C), align=PP_ALIGN.LEFT):
+            text_box = slide.shapes.add_textbox(left, top, width, height)
+            text_frame = text_box.text_frame
+            _prepare_text_frame(text_frame)
+            paragraph = text_frame.paragraphs[0]
+            paragraph.text = _clip_text(text, 120)
+            _style_paragraph(paragraph, alignment=align, line_spacing=0.95, space_after=Pt(0))
+            for run in paragraph.runs:
+                run.font.name = font_name
+                run.font.size = Pt(font_size)
+                run.font.bold = bold
+                run.font.italic = italic
+                run.font.color.rgb = RGBColor(*color)
+            return text_box
+
+        def _remove_shape(shape):
+            try:
+                sp = shape.element
+                sp.getparent().remove(sp)
+            except Exception:
+                pass
+
+        def _get_brand_campaign_title():
+            campaign_name = _clean_text(data.get('campaignName') or data.get('campaign_name') or '')
+            brand_name = _clean_text(data.get('brand') or data.get('brand_name') or '')
+            combined_context = f"{campaign_name} {_clean_text(data.get('deliverables'))} {_clean_text(data.get('creator'))}".lower()
+            occasion = ""
+            for keyword, label in [
+                ("diwali", "Diwali"),
+                ("summer", "Summer"),
+                ("winter", "Winter"),
+                ("launch", "Launch"),
+                ("airport", "Travel"),
+                ("travel", "Travel"),
+                ("fashion", "Fashion"),
+            ]:
+                if keyword in combined_context:
+                    occasion = label
+                    break
+            if campaign_name and brand_name:
+                if occasion:
+                    return f"{brand_name} {occasion} Campaign"
+                if brand_name.lower() in campaign_name.lower() and len(campaign_name) <= 38:
+                    return campaign_name
+                return f"{brand_name} Creator Campaign"
+            if brand_name:
+                if occasion:
+                    return f"{brand_name} {occasion} Campaign"
+                return f"{brand_name} Creator Campaign"
+            return campaign_name or 'Campaign Report'
+
+        def _set_metric_block(text_frame, metrics, extras=None, learnings_text=""):
+            _prepare_text_frame(text_frame)
+            visible_metrics = [(label, _clean_text(value)) for label, value in (metrics or []) if _has_value(value)]
+            visible_extras = [(label, _clip_text(value, 72)) for label, value in (extras or []) if _has_value(value)]
+            learnings_summary = _summarize_sentences(learnings_text, sentence_limit=2, char_limit=190)
+
+            total_lines = len(visible_metrics) + len(visible_extras) + (1 if learnings_summary else 0)
+            body_size = 16
+            if total_lines >= 10:
+                body_size = 13
+            elif total_lines >= 8:
+                body_size = 14
+            elif total_lines >= 6:
+                body_size = 15
+
+            def _add_label_value(paragraph, label, value):
+                _style_paragraph(paragraph, line_spacing=1.0 if body_size >= 15 else 0.96, space_after=Pt(1))
+                label_run = paragraph.add_run()
+                label_run.text = label
+                label_run.font.bold = True
+                label_run.font.name = 'Aptos'
+                label_run.font.size = Pt(body_size)
+                label_run.font.color.rgb = RGBColor(0x2B, 0x3E, 0x5C)
+
+                value_run = paragraph.add_run()
+                value_run.text = value
+                value_run.font.bold = False
+                value_run.font.name = 'Aptos'
+                value_run.font.size = Pt(body_size)
+                value_run.font.color.rgb = RGBColor(0x2B, 0x3E, 0x5C)
+
+            for index, (label, value) in enumerate(visible_metrics):
+                paragraph = text_frame.paragraphs[0] if index == 0 else text_frame.add_paragraph()
+                _add_label_value(paragraph, label, value)
+
+            remaining_slots = max(0, 10 - len(visible_metrics) - (1 if learnings_summary else 0))
+            for label, value in visible_extras[:remaining_slots]:
+                paragraph = text_frame.add_paragraph()
+                _add_label_value(paragraph, label, value)
+
+            if learnings_summary:
+                paragraph = text_frame.add_paragraph()
+                _style_paragraph(paragraph, line_spacing=1.0 if body_size >= 15 else 0.96, space_after=Pt(0))
+
+                label_run = paragraph.add_run()
+                label_run.text = "Learnings: "
+                label_run.font.bold = True
+                label_run.font.name = 'Aptos'
+                label_run.font.size = Pt(max(body_size - 1, 12))
+                label_run.font.color.rgb = RGBColor(0x2B, 0x3E, 0x5C)
+
+                value_run = paragraph.add_run()
+                value_run.text = learnings_summary
+                value_run.font.bold = False
+                value_run.font.name = 'Aptos'
+                value_run.font.size = Pt(max(body_size - 1, 12))
+                value_run.font.color.rgb = RGBColor(0x2B, 0x3E, 0x5C)
+
+        def _clone_slide_from_template(presentation, source_slide, insert_index=None):
+            new_slide = presentation.slides.add_slide(source_slide.slide_layout)
+
+            for shape in list(new_slide.shapes):
+                sp = shape.element
+                sp.getparent().remove(sp)
+
+            for shape_element in source_slide.shapes._spTree:
+                if shape_element.tag.endswith('extLst'):
+                    continue
+                if shape_element.tag.endswith('pic'):
+                    continue
+                new_slide.shapes._spTree.insert_element_before(copy.deepcopy(shape_element), 'p:extLst')
+
+            for shape in source_slide.shapes:
+                if getattr(shape, 'shape_type', None) == 13:
+                    try:
+                        image_stream = io.BytesIO(shape.image.blob)
+                        picture = new_slide.shapes.add_picture(
+                            image_stream,
+                            shape.left,
+                            shape.top,
+                            width=shape.width,
+                            height=shape.height
+                        )
+                        picture.rotation = getattr(shape, 'rotation', 0)
+                    except Exception as picture_copy_error:
+                        print(f"[WARNING] Could not clone picture shape: {picture_copy_error}")
+
+            if insert_index is not None:
+                slide_id_list = presentation.slides._sldIdLst
+                new_slide_id = slide_id_list[-1]
+                slide_id_list.remove(new_slide_id)
+                slide_id_list.insert(insert_index, new_slide_id)
+
+            return new_slide
+
+        def _render_creator_detail_slide(slide, creator_item, creator_index, creator_total, creator_image_stream=None, insight_stream=None):
+            creator_name_local = creator_item.get('name', 'Creator')
+            creator_budget_display_local = creator_item.get('budget') or data.get('financial', {}).get('totalBudget') or ''
+            budget_currency_local = data.get('financial', {}).get('budgetCurrency') or ''
+            if creator_budget_display_local and budget_currency_local:
+                creator_budget_display_local = f"{creator_budget_display_local} {budget_currency_local}"
+
+            brand_name_local = creator_item.get('brand') or data.get('brand') or data.get('brand_name', 'Brand')
+            for shape in list(slide.shapes):
+                shape_text = getattr(shape, 'text', '')
+                if not hasattr(shape, 'text_frame'):
+                    continue
+                if 'Confidential' in shape_text:
+                    continue
+                if getattr(shape, 'left', 0) < 3600000 and getattr(shape, 'top', 0) < 4300000:
+                    _remove_shape(shape)
+
+            _set_textbox_text(
+                slide,
+                430000,
+                430000,
+                3000000,
+                430000,
+                f"{creator_name_local} for {brand_name_local}",
+                font_size=18,
+                bold=True,
+                italic=True,
+                align=PP_ALIGN.LEFT,
+            )
+
+            financial_data_local = data.get('financial', {})
+            metrics_local = [
+                ("No. of Views: ", _display_value(_first_present(creator_item.get('views')))),
+                ("Likes: ", _display_value(_first_present(creator_item.get('likes')))),
+                ("Comments: ", _display_value(_first_present(creator_item.get('comments')))),
+                ("Shares: ", _display_value(_first_present(creator_item.get('shares')))),
+                ("Saves: ", _display_value(_first_present(creator_item.get('saves')))),
+                ("Reach: ", _display_value(_first_present(creator_item.get('reach')))),
+                ("Engagement Rate: ", _display_value(_first_present(creator_item.get('engagementRate')))),
+                ("Total Engagement: ", _display_value(_prefer_interactions(creator_item.get('total_engagement'), creator_item.get('interactions')))),
+                ("Budget: ", _display_value(creator_budget_display_local)),
+                ("CPC: ", _display_value(_first_present(creator_item.get('cpc'), financial_data_local.get('cpc')))),
+                ("CPV: ", _display_value(_first_present(creator_item.get('cpv'), financial_data_local.get('cpv')))),
+                ("CPE: ", _display_value(_first_present(creator_item.get('cpe'), financial_data_local.get('cpe'))))
+            ]
+            extras_local = [
+                ("Slide: ", f"{creator_index + 1} of {creator_total}"),
+                ("Platform: ", _display_value(creator_item.get('platform') or 'Instagram')),
+                ("CPC Goal: ", _display_value(creator_item.get('cpcGoal') or financial_data_local.get('cpcGoal') or '')),
+                ("CPV Goal: ", _display_value(creator_item.get('cpvGoal') or financial_data_local.get('cpvGoal') or '')),
+                ("CPC Calculation: ", _display_value(creator_item.get('cpcCalculation') or financial_data_local.get('cpcCalculation') or '')),
+                ("CPV Calculation: ", _display_value(creator_item.get('cpvCalculation') or financial_data_local.get('cpvCalculation') or '')),
+            ]
+            learnings_text_local = creator_item.get('learnings', data.get('performance', {}).get('keyLearnings', ''))
+            metric_box = slide.shapes.add_textbox(260000, 1470000, 2480000, 1980000)
+            _set_metric_block(metric_box.text_frame, metrics_local, extras_local, learnings_text_local)
+
+            if not creator_image_stream:
+                creator_image_stream = _download_image_stream(creator_item.get("postImage") or data.get("postImage"))
+
+            if creator_image_stream:
+                text_placeholder = None
+                for shape in slide.shapes:
+                    if hasattr(shape, 'text') and 'Creator content picture here' in shape.text:
+                        text_placeholder = shape
+                        break
+                if text_placeholder:
+                    sp = text_placeholder.element
+                    sp.getparent().remove(sp)
+
+                creator_placeholder = None
+                for shape in slide.shapes:
+                    if shape.shape_type == 1 and 3900000 < shape.left < 4500000 and 1000000 < shape.top < 2000000:
+                        creator_placeholder = {
+                            'shape': shape,
+                            'left': shape.left,
+                            'top': shape.top,
+                            'width': shape.width,
+                            'height': shape.height
+                        }
+                        break
+
+                if creator_placeholder:
+                    sp = creator_placeholder['shape'].element
+                    sp.getparent().remove(sp)
+                    _add_picture_with_fallback(slide, creator_image_stream, placeholder=creator_placeholder)
+                else:
+                    default_creator_box = {
+                        'left': 3958173,
+                        'top': 1105651,
+                        'width': 2559000,
+                        'height': 2932200,
+                        'rotation': 0,
+                    }
+                    _add_picture_with_fallback(slide, creator_image_stream, default_box=default_creator_box)
+
+            if insight_stream:
+                text_placeholder = None
+                for shape in slide.shapes:
+                    if hasattr(shape, 'text') and 'content insights here' in shape.text:
+                        text_placeholder = shape
+                        break
+                if text_placeholder:
+                    sp = text_placeholder.element
+                    sp.getparent().remove(sp)
+
+                insight_placeholder = None
+                for shape in slide.shapes:
+                    if shape.shape_type == 1 and shape.left > 6000000:
+                        insight_placeholder = {
+                            'shape': shape,
+                            'left': shape.left,
+                            'top': shape.top,
+                            'width': shape.width,
+                            'height': shape.height
+                        }
+                        break
+
+                if insight_placeholder:
+                    sp = insight_placeholder['shape'].element
+                    sp.getparent().remove(sp)
+                    insight_stream.seek(0)
+                    slide.shapes.add_picture(
+                        insight_stream,
+                        insight_placeholder['left'],
+                        insight_placeholder['top'],
+                        width=insight_placeholder['width'],
+                        height=insight_placeholder['height']
+                    )
 
         def _prefer_interactions(total_engagement_value, total_interactions_value):
             interaction_value = _first_present(total_interactions_value)
@@ -1567,16 +2169,14 @@ def populate_powerpoint(data, images):
                       for c in data.get('image_classifications', []))
             ]
             
+            logo_placeholder = None
+            for shape in slide_1.shapes:
+                if hasattr(shape, 'text') and 'BRAND LOGO HERE' in shape.text.upper():
+                    logo_placeholder = shape
+                    break
+
             if logo_images:
                 print("[DESIGN] Adding brand logo to Slide 1")
-                
-                # Find the "BRAND LOGO HERE" text box and get its position
-                logo_placeholder = None
-                for shape in slide_1.shapes:
-                    if hasattr(shape, 'text') and 'BRAND LOGO HERE' in shape.text.upper():
-                        logo_placeholder = shape
-                        break
-                
                 if logo_placeholder:
                     # Get position and size from placeholder
                     left = logo_placeholder.left
@@ -1593,18 +2193,49 @@ def populate_powerpoint(data, images):
                     logo_images[0].seek(0)
                     
                     with io.BytesIO(img_bytes) as img_stream:
-                        slide_1.shapes.add_picture(
+                        _add_picture_with_fallback(
+                            slide_1,
                             img_stream,
-                            left,
-                            top,
-                            width=width,
-                            height=height
+                            default_box={
+                                'left': left,
+                                'top': top,
+                                'width': width,
+                                'height': height,
+                                'rotation': 0,
+                            }
                         )
                     
                     print("[OK] Brand logo inserted successfully on Slide 1")
                 else:
                     print("[WARNING]  'BRAND LOGO HERE' placeholder not found on Slide 1")
+            elif logo_placeholder:
+                left = logo_placeholder.left
+                top = logo_placeholder.top
+                width = logo_placeholder.width
+                height = logo_placeholder.height
+                _remove_shape(logo_placeholder)
+                brand_logo_stream = _download_image_stream(data.get('brandLogo') or '')
+                if brand_logo_stream:
+                    _add_picture_with_fallback(
+                        slide_1,
+                        brand_logo_stream,
+                        default_box={
+                            'left': left,
+                            'top': top,
+                            'width': width,
+                            'height': height,
+                            'rotation': 0,
+                        }
+                    )
             else:
+                if logo_placeholder:
+                    left = logo_placeholder.left
+                    top = logo_placeholder.top
+                    width = logo_placeholder.width
+                    height = logo_placeholder.height
+                    _remove_shape(logo_placeholder)
+                    brand_fallback = slide_1.shapes.add_textbox(left, top, width, height)
+                    _set_title_text(brand_fallback, _clean_text(data.get('brand') or 'Brand'), align=PP_ALIGN.LEFT, italic=False)
                 print("[WARNING]  No brand logo image classified in uploaded images")
         
         # SLIDE 3: Campaign Name with proper styling
@@ -1614,21 +2245,8 @@ def populate_powerpoint(data, images):
             for shape in slide_3.shapes:
                 if hasattr(shape, 'text') and '[Campaign Name Here]' in shape.text:
                     if hasattr(shape, 'text_frame'):
-                        text_frame = shape.text_frame
-                        text_frame.clear()  # Clear existing text
-                        
-                        # Add campaign name with proper formatting
-                        p = text_frame.paragraphs[0]
-                        campaign_name = data.get('campaignName') or data.get('campaign_name') or 'Campaign Report'
-                        p.text = campaign_name
-                        p.alignment = PP_ALIGN.CENTER
-
-                        # Set font properties
-                        for run in p.runs:
-                            run.font.name = 'YouTube Sans'
-                            run.font.size = Pt(53)
-                            run.font.bold = True
-                            run.font.color.rgb = RGBColor(0x2B, 0x3E, 0x5C)  # #2b3e5c
+                        campaign_name = _get_brand_campaign_title()
+                        _set_title_text(shape, campaign_name, align=PP_ALIGN.CENTER, italic=False)
 
                         print(f"[OK] Updated Slide 3 with styled campaign name: {campaign_name}")
         
@@ -1647,76 +2265,38 @@ def populate_powerpoint(data, images):
             for shape in slide_4.shapes:
                 if hasattr(shape, 'text_frame') and hasattr(shape, 'text') and 'No. of Views:' in shape.text:
                     text_frame = shape.text_frame
-                    text_frame.clear()
 
                     # Define metrics with labels and values (support both old and new formats)
                     metrics = [
-                        ("No. of Views: ", _first_present(performance.get('totalViews'), instagram.get('views'), overall.get('views'))),
-                        ("Likes: ", _first_present(performance.get('totalLikes'), instagram.get('likes'), overall.get('likes'))),
-                        ("Shares: ", _first_present(performance.get('totalShares'), instagram.get('shares'), overall.get('shares'))),
-                        ("Saves: ", _first_present(performance.get('totalSaves'), instagram.get('saves'), overall.get('saves'))),
-                        ("Total Engagement: ", _prefer_interactions(performance.get('totalEngagement'), performance.get('totalInteractions')) or overall.get('total_engagement') or ''),
-                        ("Budget: ", budget_display),
-                        ("CPC: ", _first_present(financial.get('cpc'), overall.get('cpc'))),
-                        ("CPV: ", _first_present(financial.get('cpv'), overall.get('cpv'))),
-                        ("CPE: ", _first_present(financial.get('cpe'), overall.get('cpe')))
+                        ("No. of Views: ", _display_value(_first_present(performance.get('totalViews'), instagram.get('views'), overall.get('views')))),
+                        ("Likes: ", _display_value(_first_present(performance.get('totalLikes'), instagram.get('likes'), overall.get('likes')))),
+                        ("Comments: ", _display_value(_first_present(performance.get('totalComments'), instagram.get('comments'), overall.get('comments')))),
+                        ("Shares: ", _display_value(_first_present(performance.get('totalShares'), instagram.get('shares'), overall.get('shares')))),
+                        ("Saves: ", _display_value(_first_present(performance.get('totalSaves'), instagram.get('saves'), overall.get('saves')))),
+                        ("Reach: ", _display_value(_first_present(performance.get('totalReach'), instagram.get('reach'), overall.get('reach')))),
+                        ("Engagement Rate: ", _display_value(_first_present(instagram.get('engagementRate'), overall.get('engagementRate')))),
+                        ("Total Engagement: ", _display_value(_prefer_interactions(performance.get('totalEngagement'), performance.get('totalInteractions')) or overall.get('total_engagement') or '')),
+                        ("Budget: ", _display_value(budget_display)),
+                        ("CPC: ", _display_value(_first_present(financial.get('cpc'), overall.get('cpc')))),
+                        ("CPV: ", _display_value(_first_present(financial.get('cpv'), overall.get('cpv')))),
+                        ("CPE: ", _display_value(_first_present(financial.get('cpe'), overall.get('cpe'))))
                     ]
-                    
-                    # Add each metric with bold labels and normal values
-                    for i, (label, value) in enumerate(metrics):
-                        if i == 0:
-                            p = text_frame.paragraphs[0]
-                        else:
-                            p = text_frame.add_paragraph()
-                        
-                        # Add label (bold)
-                        run = p.add_run()
-                        run.text = label
-                        run.font.bold = True
-                        
-                        # Add value (normal)
-                        run = p.add_run()
-                        run.text = str(value)
-                        run.font.bold = False
 
                     extras = [
-                        ("CPC Goal: ", financial.get('cpcGoal') or ''),
-                        ("CPV Goal: ", financial.get('cpvGoal') or ''),
-                        ("CPC Calculation: ", financial.get('cpcCalculation') or ''),
-                        ("CPV Calculation: ", financial.get('cpvCalculation') or ''),
+                        ("Campaign: ", _display_value(data.get('campaignName') or data.get('campaign_name') or '')),
+                        ("Brand: ", _display_value(data.get('brand') or data.get('brand_name') or '')),
+                        ("Creators: ", _display_value(data.get('creator') or '')),
+                        ("CPC Goal: ", _display_value(financial.get('cpcGoal') or '')),
+                        ("CPV Goal: ", _display_value(financial.get('cpvGoal') or '')),
+                        ("CPC Calculation: ", _display_value(financial.get('cpcCalculation') or '')),
+                        ("CPV Calculation: ", _display_value(financial.get('cpvCalculation') or '')),
                     ]
-                    for label, value in extras:
-                        if value:
-                            p = text_frame.add_paragraph()
-                            run = p.add_run()
-                            run.text = label
-                            run.font.bold = True
-                            run = p.add_run()
-                            run.text = str(value)
-                            run.font.bold = False
-                    
-                    # Add learnings (keep only first 2 sentences)
-                    learnings_text = overall.get('learnings', 'No learnings available.')
-                    # Split by periods and keep first 2 sentences
-                    sentences = [s.strip() + '.' for s in learnings_text.split('.') if s.strip()]
-                    learnings_text = ' '.join(sentences[:2]) if sentences else learnings_text
-                    
-                    # Add empty line before learnings
-                    p = text_frame.add_paragraph()
-                    p.text = ""
-                    
-                    # Add learnings paragraph (normal text, not bold)
-                    p = text_frame.add_paragraph()
-                    
-                    # Add "Learnings:" label (bold)
-                    run = p.add_run()
-                    run.text = "Learnings: "
-                    run.font.bold = True
-                    
-                    # Add learnings text (normal, not bold)
-                    run = p.add_run()
-                    run.text = learnings_text
-                    run.font.bold = False
+                    learnings_text = (
+                        overall.get('learnings')
+                        or performance.get('keyLearnings')
+                        or 'No learnings available.'
+                    )
+                    _set_metric_block(text_frame, metrics, extras, learnings_text)
                     
                     print("[OK] Updated Slide 4 with bold formatting for overall campaign metrics")
                     break
@@ -1728,9 +2308,28 @@ def populate_powerpoint(data, images):
                 fallback_any=False,
             )
             if not campaign_image_streams:
-                fallback_campaign_image = _download_image_stream(data.get("postImage"))
-                if fallback_campaign_image:
-                    campaign_image_streams.append(fallback_campaign_image)
+                url_image_candidates = []
+                seen_url_images = set()
+
+                for creator_item in data.get("creators", []) or []:
+                    if not isinstance(creator_item, dict):
+                        continue
+                    image_url = (creator_item.get("postImage") or "").strip()
+                    if image_url and image_url not in seen_url_images:
+                        seen_url_images.add(image_url)
+                        url_image_candidates.append(image_url)
+                    if len(url_image_candidates) >= 3:
+                        break
+
+                top_level_post_image = (data.get("postImage") or "").strip()
+                if top_level_post_image and top_level_post_image not in seen_url_images and len(url_image_candidates) < 3:
+                    seen_url_images.add(top_level_post_image)
+                    url_image_candidates.append(top_level_post_image)
+
+                for image_url in url_image_candidates[:3]:
+                    fallback_campaign_image = _download_image_stream(image_url)
+                    if fallback_campaign_image:
+                        campaign_image_streams.append(fallback_campaign_image)
             
             if campaign_image_streams:
                 print(f"[IMAGE] Adding {len(campaign_image_streams[:3])} campaign photos to Slide 4")
@@ -1748,282 +2347,73 @@ def populate_powerpoint(data, images):
                     sp.getparent().remove(sp)
                     print("[OK] Removed 'Campaign Photos Here' text placeholder")
                 
-                # Find AUTO_SHAPE placeholders (shapes for 3 photos with rotation)
-                # Collect ALL placeholder info BEFORE deleting any
                 shape_placeholders = []
-                shapes_to_check = list(slide_4.shapes)  # Fresh list after text deletion
+                shapes_to_check = list(slide_4.shapes)
                 for shape in shapes_to_check:
-                    if shape.shape_type == 1:  # AUTO_SHAPE
-                        # Check if it's in the right area (right side of slide)
-                        if shape.left > 3000000 and shape.top > 1000000 and shape.top < 4000000:
-                            shape_placeholders.append({
-                                'shape': shape,
-                                'left': shape.left,
-                                'top': shape.top,
-                                'width': shape.width,
-                                'height': shape.height,
-                                'rotation': shape.rotation
-                            })
-                
-                # Sort by left position to maintain order (left to right)
-                shape_placeholders.sort(key=lambda x: x['left'])
-                
-                print(f"Found {len(shape_placeholders)} photo placeholders")
-                
-                # Now delete all placeholder shapes
-                for placeholder in shape_placeholders:
-                    sp = placeholder['shape'].element
-                    sp.getparent().remove(sp)
-                
-                # Now add all images with their rotation
-                for idx, (img_stream, placeholder) in enumerate(zip(campaign_image_streams[:3], shape_placeholders[:3])):
-                    _add_picture_with_fallback(slide_4, img_stream, placeholder=placeholder, rotation=placeholder['rotation'])
-                    
-                    print(f"[OK] Added campaign photo {idx + 1} with rotation {placeholder['rotation']:.2f}°")
+                    if shape.shape_type == 1 and shape.left > 3000000 and shape.top > 900000 and shape.top < 4200000:
+                        shape_placeholders.append(shape)
 
-                if not shape_placeholders and campaign_image_streams:
-                    default_campaign_box = {
-                        'left': 3900000,
-                        'top': 1000000,
-                        'width': 5100000,
-                        'height': 3100000,
-                        'rotation': 0,
-                    }
-                    if _add_picture_with_fallback(slide_4, campaign_image_streams[0], default_box=default_campaign_box):
-                        print("[OK] Added fallback campaign image using default Slide 4 bounds")
+                for placeholder_shape in shape_placeholders:
+                    _remove_shape(placeholder_shape)
+
+                layout_boxes_by_count = {
+                    1: [
+                        {'left': 4800000, 'top': 980000, 'width': 2200000, 'height': 2450000, 'rotation': 0},
+                    ],
+                    2: [
+                        {'left': 4100000, 'top': 980000, 'width': 1650000, 'height': 2300000, 'rotation': -9},
+                        {'left': 6350000, 'top': 980000, 'width': 1650000, 'height': 2300000, 'rotation': 5},
+                    ],
+                    3: [
+                        {'left': 3600000, 'top': 1020000, 'width': 1450000, 'height': 2100000, 'rotation': -11},
+                        {'left': 5350000, 'top': 900000, 'width': 1650000, 'height': 2350000, 'rotation': 0},
+                        {'left': 7350000, 'top': 1020000, 'width': 1350000, 'height': 2050000, 'rotation': 8},
+                    ],
+                }
+                active_layout = layout_boxes_by_count.get(min(len(campaign_image_streams[:3]), 3), layout_boxes_by_count[1])
+                for idx, (img_stream, box) in enumerate(zip(campaign_image_streams[:3], active_layout)):
+                    _add_picture_with_fallback(slide_4, img_stream, default_box=box, rotation=box.get('rotation', 0))
+                    print(f"[OK] Added campaign photo {idx + 1} using fixed layout box")
         
         # SLIDE 5: Creator x Brand with bold data
         if len(prs.slides) > 4:
-            slide_5 = prs.slides[4]
-            # Support both old and new data formats
-            creator = data.get('creator_data', {})
-            creators = data.get('creators', [])
-            # Get first creator from array if available, otherwise use creator_data
-            if creators and len(creators) > 0:
-                creator = creators[0]
-                creator_name = creator.get('name', 'Creator')
-            else:
-                creator_name = creator.get('creator_name', data.get('creator', 'Creator'))
-            creator_budget_display = creator.get('budget') or data.get('financial', {}).get('totalBudget') or ''
-            budget_currency = data.get('financial', {}).get('budgetCurrency') or ''
-            if creator_budget_display and budget_currency:
-                creator_budget_display = f"{creator_budget_display} {budget_currency}"
+            slide_5_template = prs.slides[4]
+            creators = [item for item in data.get('creators', []) if isinstance(item, dict)]
+            if not creators:
+                fallback_creator = data.get('creator_data', {}) or {}
+                fallback_creator["name"] = fallback_creator.get('creator_name', data.get('creator', 'Creator'))
+                creators = [fallback_creator]
 
-            brand_name = data.get('brand') or data.get('brand_name', 'Brand')
-            creator_title = f"{creator_name} x {brand_name}"
-
-            for shape in slide_5.shapes:
-                if hasattr(shape, 'text') and 'Creator x Brand Name' in shape.text:
-                    if hasattr(shape, 'text_frame'):
-                        text_frame = shape.text_frame
-                        text_frame.clear()
-
-                        # Add title with proper formatting
-                        p = text_frame.paragraphs[0]
-                        p.text = creator_title
-
-                        # Set font properties
-                        for run in p.runs:
-                            run.font.name = 'YouTube Sans'
-                            run.font.size = Pt(25)
-                            run.font.bold = True
-                            run.font.italic = True
-                            run.font.color.rgb = RGBColor(0x2B, 0x3E, 0x5C)  # #2b3e5c
-
-                        print(f"[OK] Updated Slide 5 title with styling: {creator_title}")
-                    else:
-                        shape.text = creator_title
-                        print(f"[OK] Updated Slide 5 title: {creator_title}")
-
-                if hasattr(shape, 'text_frame') and hasattr(shape, 'text') and 'No. of Views:' in shape.text and 'Learnings:' in shape.text:
-                    text_frame = shape.text_frame
-                    text_frame.clear()
-
-                    # Define metrics with labels and values (support both old and new formats)
-                    financial_data = data.get('financial', {})
-                    metrics = [
-                        ("No. of Views: ", _first_present(creator.get('views'))),
-                        ("Likes: ", _first_present(creator.get('likes'))),
-                        ("Shares: ", _first_present(creator.get('shares'))),
-                        ("Saves: ", _first_present(creator.get('saves'))),
-                        ("Total Engagement: ", _prefer_interactions(creator.get('total_engagement'), creator.get('interactions'))),
-                        ("Budget: ", creator_budget_display),
-                        ("CPC: ", _first_present(creator.get('cpc'), financial_data.get('cpc'))),
-                        ("CPV: ", _first_present(creator.get('cpv'), financial_data.get('cpv'))),
-                        ("CPE: ", _first_present(creator.get('cpe'), financial_data.get('cpe')))
-                    ]
-                    
-                    # Add each metric with bold labels and normal values
-                    for i, (label, value) in enumerate(metrics):
-                        if i == 0:
-                            p = text_frame.paragraphs[0]
-                        else:
-                            p = text_frame.add_paragraph()
-                        
-                        # Add label (bold)
-                        run = p.add_run()
-                        run.text = label
-                        run.font.bold = True
-                        
-                        # Add value (normal)
-                        run = p.add_run()
-                        run.text = str(value)
-                        run.font.bold = False
-
-                    extras = [
-                        ("CPC Goal: ", creator.get('cpcGoal') or data.get('financial', {}).get('cpcGoal') or ''),
-                        ("CPV Goal: ", creator.get('cpvGoal') or data.get('financial', {}).get('cpvGoal') or ''),
-                        ("CPC Calculation: ", creator.get('cpcCalculation') or data.get('financial', {}).get('cpcCalculation') or ''),
-                        ("CPV Calculation: ", creator.get('cpvCalculation') or data.get('financial', {}).get('cpvCalculation') or ''),
-                    ]
-                    for label, value in extras:
-                        if value:
-                            p = text_frame.add_paragraph()
-                            run = p.add_run()
-                            run.text = label
-                            run.font.bold = True
-                            run = p.add_run()
-                            run.text = str(value)
-                            run.font.bold = False
-                    
-                    # Add learnings (keep only first 2 sentences)
-                    learnings_text = creator.get('learnings', 'No learnings available.')
-                    # Split by periods and keep first 2 sentences
-                    sentences = [s.strip() + '.' for s in learnings_text.split('.') if s.strip()]
-                    learnings_text = ' '.join(sentences[:2]) if sentences else learnings_text
-                    
-                    # Add empty line before learnings
-                    p = text_frame.add_paragraph()
-                    p.text = ""
-                    
-                    # Add learnings paragraph (normal text, not bold)
-                    p = text_frame.add_paragraph()
-                    
-                    # Add "Learnings:" label (bold)
-                    run = p.add_run()
-                    run.text = "Learnings: "
-                    run.font.bold = True
-                    
-                    # Add learnings text (normal, not bold)
-                    run = p.add_run()
-                    run.text = learnings_text
-                    run.font.bold = False
-                    
-                    print("[OK] Updated Slide 5 with bold formatting for creator metrics")
-            
-            # Add creator content image - Replace template placeholder
-            creator_streams, _ = _select_uploaded_streams(
+            creator_slides = creators[:3]
+            creator_image_streams, _ = _select_uploaded_streams(
                 preferred_types=['creator_content'],
-                limit=1,
+                limit=max(1, len(creator_slides)),
                 fallback_any=True,
             )
-            creator_image_stream = creator_streams[0] if creator_streams else _download_image_stream(data.get("postImage"))
-            
-            if creator_image_stream:
-                print("[IMAGE] Adding creator content image to Slide 5")
-                
-                # Find and delete text placeholder "Creator content picture here"
-                text_placeholder = None
-                for shape in slide_5.shapes:
-                    if hasattr(shape, 'text') and 'Creator content picture here' in shape.text:
-                        text_placeholder = shape
-                        break
-                
-                if text_placeholder:
-                    sp = text_placeholder.element
-                    sp.getparent().remove(sp)
-                    print("[OK] Removed 'Creator content picture here' text placeholder")
-                
-                # Find the AUTO_SHAPE placeholder for creator content (Shape 2)
-                # It's positioned in the middle-left area
-                creator_placeholder = None
-                for shape in slide_5.shapes:
-                    if shape.shape_type == 1:  # AUTO_SHAPE
-                        # Check if it's the creator content placeholder (left side, middle height)
-                        if 3900000 < shape.left < 4500000 and 1000000 < shape.top < 2000000:
-                            creator_placeholder = {
-                                'shape': shape,
-                                'left': shape.left,
-                                'top': shape.top,
-                                'width': shape.width,
-                                'height': shape.height
-                            }
-                            break
-                
-                if creator_placeholder:
-                    # Delete the placeholder shape
-                    sp = creator_placeholder['shape'].element
-                    sp.getparent().remove(sp)
-                    
-                    # Insert image at the same position and size
-                    _add_picture_with_fallback(slide_5, creator_image_stream, placeholder=creator_placeholder)
-                    
-                    print("[OK] Replaced creator content placeholder with actual image")
-                else:
-                    default_creator_box = {
-                        'left': 3958173,
-                        'top': 1105651,
-                        'width': 2559000,
-                        'height': 2932200,
-                        'rotation': 0,
-                    }
-                    if _add_picture_with_fallback(slide_5, creator_image_stream, default_box=default_creator_box):
-                        print("[OK] Added fallback creator image using default Slide 5 bounds")
-            
-            # Add insights screenshot - Replace template placeholder
             insight_streams, _ = _select_uploaded_streams(
                 preferred_types=['insights_screenshot', 'campaign_dashboard'],
-                limit=1,
+                limit=max(1, len(creator_slides)),
                 fallback_any=True,
             )
-            
-            if insight_streams:
-                print("[IMAGE] Adding insights screenshot to Slide 5")
-                
-                # Find and delete text placeholder "Creator's content insights here"
-                text_placeholder = None
-                for shape in slide_5.shapes:
-                    if hasattr(shape, 'text') and 'content insights here' in shape.text:
-                        text_placeholder = shape
-                        break
-                
-                if text_placeholder:
-                    sp = text_placeholder.element
-                    sp.getparent().remove(sp)
-                    print("[OK] Removed 'Creator's content insights here' text placeholder")
-                
-                # Find the AUTO_SHAPE placeholder for insights (Shape 3)
-                # It's positioned on the right side
-                insight_placeholder = None
-                for shape in slide_5.shapes:
-                    if shape.shape_type == 1:  # AUTO_SHAPE
-                        # Check if it's the insights placeholder (right side)
-                        if shape.left > 6000000:
-                            insight_placeholder = {
-                                'shape': shape,
-                                'left': shape.left,
-                                'top': shape.top,
-                                'width': shape.width,
-                                'height': shape.height
-                            }
-                            break
-                
-                if insight_placeholder:
-                    # Delete the placeholder shape
-                    sp = insight_placeholder['shape'].element
-                    sp.getparent().remove(sp)
-                    
-                    # Insert image at the same position and size
-                    insight_streams[0].seek(0)
-                    slide_5.shapes.add_picture(
-                        insight_streams[0],
-                        insight_placeholder['left'],
-                        insight_placeholder['top'],
-                        width=insight_placeholder['width'],
-                        height=insight_placeholder['height']
-                    )
-                    
-                    print("[OK] Replaced insights placeholder with actual screenshot")
+
+            creator_detail_slides = [slide_5_template]
+            insert_index = 5
+            for _ in creator_slides[1:]:
+                creator_detail_slides.append(
+                    _clone_slide_from_template(prs, slide_5_template, insert_index=insert_index)
+                )
+                insert_index += 1
+
+            for creator_index, (detail_slide, creator_item) in enumerate(zip(creator_detail_slides, creator_slides)):
+                _render_creator_detail_slide(
+                    detail_slide,
+                    creator_item,
+                    creator_index,
+                    len(creator_slides),
+                    creator_image_stream=creator_image_streams[creator_index] if creator_index < len(creator_image_streams) else None,
+                    insight_stream=insight_streams[creator_index] if creator_index < len(insight_streams) else (insight_streams[0] if insight_streams else None),
+                )
+                print(f"[OK] Rendered Slide 5 detail slide {creator_index + 1}/{len(creator_slides)}: {creator_item.get('name', 'Creator')}")
         
         # Save the presentation
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
@@ -2186,31 +2576,68 @@ def generate_report():
         warnings = []
         # Get form data
         prompt = request.form.get('prompt', '')
+        raw_budget_values = request.form.get('budget_inr_values', '').strip()
         raw_images = request.files.getlist('images')
         images = [make_in_memory_upload(image) for image in raw_images]
         instagram_post_url = request.form.get('instagram_post_url', '').strip()
         instagram_profile_url = request.form.get('instagram_profile_url', '').strip()
         instagram_username = request.form.get('instagram_username', '').strip()
         youtube_post_url   = request.form.get('youtube_post_url',  '').strip()
+        content_urls = _extract_urls_from_text(instagram_post_url)
+        max_content_urls = 3
+        all_instagram_post_urls = [
+            url for url in content_urls
+            if "instagram.com" in url.lower() and any(token in url.lower() for token in ["/reel/", "/p/", "/tv/"])
+        ]
+        all_youtube_urls = [url for url in content_urls if "youtube.com" in url.lower() or "youtu.be" in url.lower()]
+        instagram_post_urls = all_instagram_post_urls[:max_content_urls]
+        youtube_urls = all_youtube_urls[:max_content_urls]
+
+        budget_inr_values = []
+        if raw_budget_values:
+            try:
+                parsed_budget_values = json.loads(raw_budget_values)
+                if isinstance(parsed_budget_values, list):
+                    budget_inr_values = [str(value).strip() if value is not None else "" for value in parsed_budget_values[:3]]
+            except Exception:
+                budget_inr_values = [value.strip() for value in raw_budget_values.splitlines()[:3]]
 
         # Validate: need at least one input
-        if not prompt and not images and not instagram_post_url and not instagram_profile_url and not instagram_username and not youtube_post_url:
+        if not prompt and not images and not instagram_post_urls and not instagram_profile_url and not instagram_username and not youtube_post_url and not youtube_urls:
             return jsonify({"success": False, "error": "Provide a prompt, images, an Instagram username/profile URL, or a post URL"}), 400
 
         print(f"\n{'='*60}")
         print(f"[START] NEW REQUEST")
         print(f"{'='*60}")
         print(f"Prompt: {prompt}")
+        if budget_inr_values: print(f"Budget INR values: {budget_inr_values}")
         print(f"Images: {len(images)} uploaded")
-        if instagram_post_url: print(f"Instagram URL: {instagram_post_url}")
+        if instagram_post_urls: print(f"Instagram URLs: {instagram_post_urls}")
         if instagram_profile_url: print(f"Instagram Profile URL: {instagram_profile_url}")
         if instagram_username: print(f"Instagram Username: {instagram_username}")
-        if youtube_post_url:   print(f"YouTube URL:   {youtube_post_url}")
+        if youtube_post_url or youtube_urls: print(f"YouTube URL(s):   {youtube_urls or [youtube_post_url]}")
 
         # Step 1: Extract metrics from text prompt
         print("[NOTE] Extracting metrics from text...")
         text_metrics = extract_metrics_from_text(prompt) if prompt else {}
         prompt_context = extract_prompt_context(prompt) if prompt else {}
+        cleaned_budget_values = []
+        for value in budget_inr_values:
+            cleaned_value = str(value).replace(",", "").strip()
+            cleaned_budget_values.append(cleaned_value)
+
+        numeric_budget_values = []
+        for value in cleaned_budget_values:
+            try:
+                numeric_budget_values.append(float(value)) if value else None
+            except Exception:
+                continue
+
+        if numeric_budget_values:
+            prompt_context.setdefault("financial", {})
+            total_budget_sum = sum(numeric_budget_values)
+            prompt_context["financial"]["totalBudget"] = str(int(total_budget_sum)) if float(total_budget_sum).is_integer() else f"{total_budget_sum:.2f}"
+            prompt_context["financial"]["budgetCurrency"] = "INR"
 
         # Step 2: Run slow independent fetches in parallel.
         instagram_post = {}
@@ -2218,8 +2645,20 @@ def generate_report():
         youtube_metrics = {}
         ocr_metrics = {}
         extracted_data = create_default_data()
+        if instagram_post_urls:
+            extracted_data["requestedInstagramPostUrls"] = list(instagram_post_urls)
+        if youtube_urls:
+            extracted_data["requestedYoutubeUrls"] = list(youtube_urls)
+        if len(all_instagram_post_urls) > max_content_urls:
+            warnings.append(
+                f"You pasted {len(all_instagram_post_urls)} Instagram URLs. The report currently processes the first {max_content_urls} URLs for speed and cleaner combined reporting."
+            )
+        if len(all_youtube_urls) > max_content_urls:
+            warnings.append(
+                f"You pasted {len(all_youtube_urls)} YouTube URLs. The report currently processes the first {max_content_urls} URLs."
+            )
 
-        yt_url = youtube_post_url or None
+        yt_url = youtube_post_url or (youtube_urls[0] if youtube_urls else None)
         if not yt_url and prompt and ("youtube.com" in prompt or "youtu.be" in prompt):
             yt_url = prompt
         profile_ref = instagram_profile_url or instagram_username
@@ -2230,11 +2669,13 @@ def generate_report():
         )
 
         future_map = {}
-        max_workers = 1 + int(bool(instagram_post_url)) + int(bool(profile_username)) + int(bool(HAS_YT_DLP and yt_url)) + int(bool(images)) + int(bool(images))
+        instagram_post_futures = {}
+        max_workers = 1 + len(instagram_post_urls) + int(bool(profile_username)) + int(bool(HAS_YT_DLP and yt_url)) + int(bool(images)) + int(bool(images))
         with ThreadPoolExecutor(max_workers=max(1, min(6, max_workers))) as executor:
-            if instagram_post_url:
-                print(f"[INSTAGRAM POST] Fetching exact metrics from: {instagram_post_url}")
-                future_map["instagram_post"] = executor.submit(fetch_instagram_post_data, instagram_post_url)
+            for idx, url in enumerate(instagram_post_urls):
+                print(f"[INSTAGRAM POST {idx + 1}/{len(instagram_post_urls)}] Queueing exact metrics fetch from: {url}")
+                future = executor.submit(fetch_instagram_post_data, url)
+                instagram_post_futures[future] = url
 
             if profile_username:
                 print(f"[INSTAGRAM PROFILE] Fetching profile data for: {profile_ref}")
@@ -2248,15 +2689,33 @@ def generate_report():
                 future_map["ocr_metrics"] = executor.submit(extract_metrics_from_images_ocr, clone_uploads(images))
                 future_map["vision_extract"] = executor.submit(analyze_images_with_gpt4, clone_uploads(images), prompt)
 
-            if "instagram_post" in future_map:
-                post_data = future_map["instagram_post"].result()
+            instagram_post_results = []
+            for future in as_completed(instagram_post_futures):
+                url = instagram_post_futures[future]
+                try:
+                    post_data = future.result()
+                except Exception as e:
+                    post_data = None
+                    print(f"[WARNING] Instagram metrics fetch failed for {url}: {e}")
+
                 if post_data:
-                    instagram_post = post_data
-                    print(f"[OK] Post metrics fetched — likes: {post_data['instagram'].get('likes')}, views: {post_data['instagram'].get('views')}")
+                    instagram_post_results.append(post_data)
+                    if post_data.get("hasMetrics"):
+                        print(
+                            f"[OK] Post metrics fetched for {url} - likes: {post_data['instagram'].get('likes')}, "
+                            f"views: {post_data['instagram'].get('views')}"
+                        )
+                    else:
+                        print(f"[OK] Partial Instagram metadata fetched for {url}")
                 else:
                     warnings.append(
-                        "Bright Data did not return usable Instagram metrics for this URL, so the backend skipped Instagram URL metrics and continued with screenshots, prompt data, and other available sources."
+                        f"RapidAPI did not return usable Instagram metrics for {url}, so the backend skipped that URL and continued with the remaining sources."
                     )
+
+            if len(instagram_post_results) > 1:
+                instagram_post = merge_instagram_post_results(instagram_post_results) or {}
+            elif len(instagram_post_results) == 1:
+                instagram_post = instagram_post_results[0]
 
             if "instagram_profile" in future_map:
                 instagram_profile = future_map["instagram_profile"].result()
@@ -2282,6 +2741,21 @@ def generate_report():
             warnings.append(
                 "The uploaded images did not expose readable metrics, so the backend ignored them for metrics and used only prompt text and other available sources."
             )
+
+        if not images and instagram_post:
+            remote_media_uploads = build_remote_media_uploads(instagram_post)
+            if remote_media_uploads:
+                print(f"[IMAGE] Using {len(remote_media_uploads)} RapidAPI media image(s) as fallback extraction input")
+                remote_ocr_metrics = extract_metrics_from_images_ocr(clone_uploads(remote_media_uploads))
+                if remote_ocr_metrics:
+                    for key, value in remote_ocr_metrics.items():
+                        if value and value != "N/A" and not ocr_metrics.get(key):
+                            ocr_metrics[key] = value
+                if not has_meaningful_metrics(extracted_data):
+                    try:
+                        extracted_data = analyze_images_with_gpt4(clone_uploads(remote_media_uploads), prompt) or extracted_data
+                    except Exception as remote_image_error:
+                        print(f"[WARNING] Remote image fallback analysis failed: {remote_image_error}")
 
         # Treat the user's prompt as the source of truth for campaign identity fields.
         extracted_data = apply_prompt_context(extracted_data, prompt_context, force_identity=True)
@@ -2352,7 +2826,7 @@ def generate_report():
 
         # Step 5: Merge all metrics from prompt, images, and URLs.
         # Priority (highest → lowest):
-        #   1. Bright Data / direct URL metrics with non-zero values
+        #   1. RapidAPI / direct URL metrics with non-zero values
         #   2. Vision / OCR image metrics
         #   3. Prompt text metrics
         #   4. YouTube API fills YouTube fields
@@ -2440,17 +2914,47 @@ def generate_report():
         if instagram_post:
             ig_post_metrics = instagram_post.get("instagram", {})
             fill_prefer_source(extracted_data["instagram"], ig_post_metrics)
+            creator_candidates = instagram_post.get("creatorNames") or []
             if not extracted_data.get("creator"):
                 extracted_data["creator"] = (
-                    instagram_post.get("fullName") or instagram_post.get("username", "")
+                    " + ".join(creator_candidates[:3])
+                    or instagram_post.get("fullName")
+                    or instagram_post.get("username", "")
                 )
+            if (not extracted_data.get("brand") or extracted_data.get("brand") == "Unknown Brand") and instagram_post.get("brandName"):
+                extracted_data["brand"] = instagram_post.get("brandName")
             if not extracted_data.get("deliverables"):
                 extracted_data["deliverables"] = instagram_post.get("mediaType", "")
             if instagram_post.get("postImage"):
                 extracted_data["postImage"] = instagram_post.get("postImage")
             if instagram_post.get("videoUrl"):
                 extracted_data["videoUrl"] = instagram_post.get("videoUrl")
+            if instagram_post.get("brandLogo"):
+                extracted_data["brandLogo"] = instagram_post.get("brandLogo")
+            if instagram_post.get("postUrls"):
+                extracted_data["instagramPostUrls"] = instagram_post.get("postUrls")
+            if instagram_post.get("urlResults"):
+                extracted_data["instagramUrlResults"] = instagram_post.get("urlResults")
+            if instagram_post.get("summary"):
+                extracted_data["instagramCombinedSummary"] = instagram_post.get("summary")
             extracted_data["instagramSource"] = instagram_post.get("source", "instagram_url")
+            if cleaned_budget_values:
+                extracted_data["budgetPerUrl"] = [
+                    {
+                        "url": url,
+                        "budget": cleaned_budget_values[idx] if idx < len(cleaned_budget_values) else "",
+                        "currency": "INR",
+                    }
+                    for idx, url in enumerate(instagram_post_urls)
+                ]
+            if (not extracted_data.get("campaignName") or extracted_data.get("campaignName") == "Campaign Report"):
+                campaign_candidate = (
+                    instagram_post.get("postTitle")
+                    or instagram_post.get("captionText", "").splitlines()[0]
+                    or ""
+                ).strip()
+                if campaign_candidate:
+                    extracted_data["campaignName"] = campaign_candidate[:80]
 
         # Instagram profile dataset — fill remaining Instagram fields only.
         if instagram_profile:
@@ -2492,6 +2996,20 @@ def generate_report():
         for ig_key, perf_key in ig_to_perf.items():
             if _has_metric_value(ig.get(ig_key)):
                 perf[perf_key] = ig[ig_key]
+        combined_summary = extracted_data.get("instagramCombinedSummary", {}) or {}
+        combined_totals = combined_summary.get("totals", {}) or {}
+        if combined_totals:
+            total_perf_map = {
+                "views": "totalViews",
+                "likes": "totalLikes",
+                "comments": "totalComments",
+                "shares": "totalShares",
+                "saves": "totalSaves",
+                "reach": "totalReach",
+            }
+            for total_key, perf_key in total_perf_map.items():
+                if _has_metric_value(combined_totals.get(total_key)):
+                    perf[perf_key] = combined_totals[total_key]
 
         # Calculate totalInteractions = likes + comments + shares + saves
         def _safe_int(v):
@@ -2550,30 +3068,70 @@ def generate_report():
         # Propagate into creators list — dedupe and sync final instagram values
         creator_name = extracted_data.get("creator", "")
         creators = extracted_data.get("creators", [])
-        if not creators and creator_name:
+        combined_creator_names = (instagram_post.get("creatorNames") if isinstance(instagram_post, dict) else []) or []
+        combined_creator_entries = (instagram_post.get("creatorEntries") if isinstance(instagram_post, dict) else []) or []
+        if combined_creator_entries:
+            creators = [dict(entry) for entry in combined_creator_entries]
+            extracted_data["creators"] = creators
+        elif not creators and combined_creator_names:
+            creators = [{"name": name} for name in combined_creator_names]
+            extracted_data["creators"] = creators
+        elif not creators and creator_name:
             creators = [{"name": creator_name}]
             extracted_data["creators"] = creators
         deduped_creators = []
         seen_creator_keys = set()
+        budget_by_url = {}
+        for idx, url in enumerate(instagram_post_urls):
+            normalized_url = (url or "").strip().lower()
+            if not normalized_url:
+                continue
+            if idx < len(cleaned_budget_values) and cleaned_budget_values[idx]:
+                budget_by_url[normalized_url] = cleaned_budget_values[idx]
+
         for c in creators:
             if not isinstance(c, dict):
                 continue
             name = (c.get("name") or creator_name or "Creator").strip()
-            creator_key = name.lower()
+            creator_key = f"{name.lower()}|{(c.get('postUrl') or '').strip().lower()}"
             if creator_key in seen_creator_keys:
                 continue
             seen_creator_keys.add(creator_key)
             normalized_creator = dict(c)
             normalized_creator["name"] = name
             for ig_key in ["views", "likes", "comments", "shares", "saves", "reach", "engagementRate"]:
+                existing_val = normalized_creator.get(ig_key, "")
                 ig_val = ig.get(ig_key, "")
-                if _has_metric_value(ig_val):
+                if not _has_metric_value(existing_val) and _has_metric_value(ig_val):
                     normalized_creator[ig_key] = ig_val
+
+            creator_post_url = (normalized_creator.get("postUrl") or "").strip().lower()
+            creator_budget_value = normalized_creator.get("budget", "")
+            if not _has_metric_value(creator_budget_value) and creator_post_url in budget_by_url:
+                normalized_creator["budget"] = budget_by_url[creator_post_url]
+
             total = sum(_safe_int(normalized_creator.get(k)) for k in ["likes", "comments", "shares", "saves"])
             normalized_creator["interactions"] = str(total) if total > 0 else normalized_creator.get("interactions", "")
-            normalized_creator["platform"] = normalized_creator.get("platform") or "Instagram"
+            normalized_creator["platform"] = "Instagram"
+
+            creator_budget_numeric = _safe_float(normalized_creator.get("budget"))
+            creator_views_numeric = _safe_float(normalized_creator.get("views"))
+            creator_interactions_numeric = _safe_float(normalized_creator.get("interactions"))
+            creator_clicks_numeric = _safe_float(normalized_creator.get("clicks"))
+            if creator_budget_numeric > 0 and creator_views_numeric > 0:
+                normalized_creator["cpv"] = _format_formula_metric(creator_budget_numeric / creator_views_numeric)
+            if creator_budget_numeric > 0 and creator_interactions_numeric > 0:
+                normalized_creator["cpe"] = _format_formula_metric(creator_budget_numeric / creator_interactions_numeric)
+            if creator_budget_numeric > 0 and creator_clicks_numeric > 0:
+                normalized_creator["cpc"] = _format_formula_metric(creator_budget_numeric / creator_clicks_numeric)
             deduped_creators.append(normalized_creator)
         extracted_data["creators"] = deduped_creators
+        if deduped_creators:
+            extracted_data["creator"] = " + ".join(
+                creator_item.get("name", "").strip()
+                for creator_item in deduped_creators
+                if creator_item.get("name", "").strip()
+            )[:120]
 
         # Step 6: Populate PowerPoint template
         output_path = populate_powerpoint(extracted_data, images)
@@ -2601,7 +3159,7 @@ def generate_report():
         ig = extracted_data.get("instagram", {})
         has_ig_metrics = any(ig.get(k) for k in ["views", "likes", "comments", "reach"])
         if not has_ig_metrics:
-            warnings.append("No Instagram metrics found from Bright Data. Provide a valid Instagram profile URL/username or post/reel URL.")
+            warnings.append("No Instagram metrics found from RapidAPI. Provide a valid Instagram profile URL/username or post/reel URL.")
 
         return jsonify({
             "success": True,
@@ -2712,6 +3270,354 @@ def _extract_brightdata_records(payload):
     return []
 
 
+def _extract_rapidapi_media_records(payload):
+    if isinstance(payload, list):
+        records = []
+        for item in payload:
+            records.extend(_extract_rapidapi_media_records(item))
+        return records
+    if isinstance(payload, dict):
+        media_node = payload.get("xdt_shortcode_media")
+        if isinstance(media_node, dict):
+            return [media_node]
+        for key in ["data", "results", "items", "media", "post", "graphql", "response"]:
+            value = payload.get(key)
+            if isinstance(value, list):
+                records = _extract_rapidapi_media_records(value)
+                if records:
+                    return records
+            if isinstance(value, dict):
+                nested = _extract_rapidapi_media_records(value)
+                if nested:
+                    return nested
+        if payload.get("shortcode") or payload.get("video_url") or payload.get("display_url"):
+            return [payload]
+    return []
+
+
+def _fetch_rapidapi_instagram_media(shortcode):
+    import requests as req
+
+    rapidapi_key = os.environ.get("RAPIDAPI_KEY", "").strip()
+    rapidapi_host = os.environ.get("RAPIDAPI_HOST", "instagram-media-api.p.rapidapi.com").strip()
+    endpoint = os.environ.get(
+        "RAPIDAPI_INSTAGRAM_MEDIA_URL",
+        "https://instagram-media-api.p.rapidapi.com/media/shortcode",
+    ).strip()
+
+    if not rapidapi_key:
+        print("[WARNING] RapidAPI key is not configured")
+        return []
+
+    if not shortcode:
+        print("[WARNING] RapidAPI shortcode is missing")
+        return []
+
+    print(f"[RAPIDAPI] Starting fetch for shortcode: {shortcode}")
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-rapidapi-key": rapidapi_key,
+        "x-rapidapi-host": rapidapi_host,
+    }
+
+    request_variants = [
+        {"method": "post", "json": {"shortcode": shortcode, "proxy": ""}},
+        {"method": "post", "json": {"code": shortcode, "proxy": ""}},
+        {"method": "get", "params": {"shortcode": shortcode}},
+        {"method": "get", "params": {"code": shortcode}},
+    ]
+
+    for variant in request_variants:
+        try:
+            if variant["method"] == "post":
+                print(f"[RAPIDAPI] Trying POST variant for shortcode {shortcode}: {variant['json']}")
+                resp = req.post(endpoint, headers=headers, json=variant["json"], timeout=60)
+                variant_label = f"POST {list(variant['json'].keys())[0]}"
+            else:
+                print(f"[RAPIDAPI] Trying GET variant for shortcode {shortcode}: {variant['params']}")
+                resp = req.get(endpoint, headers=headers, params=variant["params"], timeout=60)
+                variant_label = f"GET {list(variant['params'].keys())[0]}"
+            resp.raise_for_status()
+            payload = resp.json()
+            records = _extract_rapidapi_media_records(payload)
+            if records:
+                print(f"[RAPIDAPI] Instagram media found using {variant_label} for shortcode {shortcode}; extracted records: {len(records)}")
+                return records
+        except Exception as e:
+            print(f"[WARNING] RapidAPI media fetch failed with {variant}: {e}")
+
+    return []
+
+
+def _extract_urls_from_text(value):
+    if not value:
+        return []
+    urls = re.findall(r"https?://[^\s,]+", value)
+    deduped = []
+    seen = set()
+    for url in urls:
+        cleaned = url.strip().rstrip(").,]")
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            deduped.append(cleaned)
+    return deduped
+
+
+def _clean_brand_candidate(value):
+    if value is None:
+        return ""
+    if isinstance(value, (list, dict)):
+        return ""
+    cleaned = re.sub(r"\s+", " ", str(value)).strip().strip("@#")
+    cleaned = re.sub(r"[^A-Za-z0-9&+ ._-]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -_.")
+    if not cleaned:
+        return ""
+    lowered = cleaned.lower()
+    alias_map = {
+        "flixbusindia": "FlixBus",
+        "flixbus india": "FlixBus",
+    }
+    if lowered in alias_map:
+        return alias_map[lowered]
+    if lowered.endswith("india") and lowered.replace(" ", "") == "flixbusindia":
+        return "FlixBus"
+    if "flixbus" in lowered:
+        return "FlixBus"
+    if cleaned.islower() or cleaned.isupper():
+        cleaned = " ".join(
+            token.upper() if token.lower() in {"bbc", "tv"} else token.capitalize()
+            for token in cleaned.split()
+        )
+    return cleaned[:40]
+
+
+def _select_unique_brand_name(candidates):
+    normalized = []
+    seen = set()
+    for candidate in candidates:
+        cleaned = _clean_brand_candidate(candidate)
+        if not cleaned:
+            continue
+        key = re.sub(r"[^a-z0-9]+", "", cleaned.lower())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        normalized.append(cleaned)
+    if not normalized:
+        return ""
+    preferred = sorted(
+        normalized,
+        key=lambda item: (
+            0 if any(ch.isupper() for ch in item) else 1,
+            0 if " " not in item else 1,
+            len(item),
+        )
+    )
+    return preferred[0]
+
+
+def merge_instagram_post_results(post_results):
+    if not post_results:
+        return None
+
+    merged = {
+        "mediaType": "",
+        "source": "rapidapi_shortcode_media_combined",
+        "username": "",
+        "fullName": "",
+        "brandUsername": "",
+        "brandName": "",
+        "brandLogo": "",
+        "creatorNames": [],
+        "creatorEntries": [],
+        "postImage": "",
+        "videoUrl": "",
+        "postUrls": [],
+        "urlResults": [],
+        "raw_data": {"rapidapi_shortcode_media": []},
+        "summary": {
+            "postCount": 0,
+            "totals": {},
+            "averages": {},
+        },
+        "instagram": {
+            "views": "",
+            "likes": "",
+            "comments": "",
+            "shares": "",
+            "saves": "",
+            "reach": "",
+            "impressions": "",
+            "engagementRate": "",
+        },
+    }
+
+    metric_keys = ["views", "likes", "comments", "shares", "saves", "impressions"]
+    metric_totals = {key: 0 for key in metric_keys}
+    metric_counts = {key: 0 for key in metric_keys}
+    reach_values = []
+    engagement_rates = []
+    media_types = []
+    creator_names = []
+    creator_entries = []
+    brand_candidates = []
+
+    for item in post_results:
+        if not isinstance(item, dict):
+            continue
+
+        ig = item.get("instagram", {}) or {}
+        merged["postUrls"].extend(item.get("postUrls") or [])
+        if item.get("urlStatus"):
+            merged["urlResults"].append(item.get("urlStatus"))
+        raw_item = item.get("raw_data", {}).get("rapidapi_shortcode_media")
+        merged["raw_data"]["rapidapi_shortcode_media"].append(raw_item)
+
+        if item.get("username") and not merged["username"]:
+            merged["username"] = item["username"]
+        if item.get("fullName") and not merged["fullName"]:
+            merged["fullName"] = item["fullName"]
+        if item.get("postImage") and not merged["postImage"]:
+            merged["postImage"] = item["postImage"]
+        if item.get("videoUrl") and not merged["videoUrl"]:
+            merged["videoUrl"] = item["videoUrl"]
+        if item.get("brandLogo") and not merged["brandLogo"]:
+            merged["brandLogo"] = item["brandLogo"]
+        if item.get("mediaType"):
+            media_types.append(item["mediaType"])
+        if item.get("fullName"):
+            creator_names.append(item["fullName"])
+        elif item.get("username"):
+            creator_names.append(item["username"])
+        creator_entry_name = item.get("fullName") or item.get("username") or ""
+        if creator_entry_name:
+            creator_entries.append({
+                "name": creator_entry_name,
+                "brand": item.get("brandName") or _infer_brand_from_post_record(raw_item) or "",
+                "platform": "Instagram",
+                "views": ig.get("views", ""),
+                "likes": ig.get("likes", ""),
+                "comments": ig.get("comments", ""),
+                "shares": ig.get("shares", ""),
+                "saves": ig.get("saves", ""),
+                "reach": ig.get("reach", ""),
+                "engagementRate": ig.get("engagementRate", ""),
+                "interactions": str(sum(_safe_int(ig.get(k)) for k in ["likes", "comments", "shares", "saves"])) or "",
+                "postUrl": (item.get("postUrls") or [""])[0],
+                "postImage": item.get("postImage", ""),
+                "videoUrl": item.get("videoUrl", ""),
+            })
+        if item.get("brandName"):
+            brand_candidates.append(item.get("brandName"))
+        if raw_item:
+            inferred_brand = _infer_brand_from_post_record(raw_item)
+            if inferred_brand:
+                brand_candidates.append(inferred_brand)
+            if not merged.get("brandLogo"):
+                inferred_logo = _infer_brand_logo_url_from_post_record(raw_item)
+                if inferred_logo:
+                    merged["brandLogo"] = inferred_logo
+
+        for key in metric_keys:
+            value = _safe_int(ig.get(key))
+            if value > 0:
+                metric_totals[key] += value
+                metric_counts[key] += 1
+
+        reach_value = _safe_int(ig.get("reach"))
+        if reach_value > 0:
+            reach_values.append(reach_value)
+
+        rate = ig.get("engagementRate")
+        if rate not in (None, "", "0", "0%"):
+            try:
+                engagement_rates.append(float(str(rate).replace("%", "").strip()))
+            except Exception:
+                pass
+
+    post_count = len([item for item in post_results if isinstance(item, dict)])
+    merged["summary"]["postCount"] = post_count
+
+    for key in metric_keys:
+        total_value = metric_totals[key]
+        average_value = round(total_value / metric_counts[key], 2) if metric_counts[key] else 0
+        if total_value > 0:
+            merged["summary"]["totals"][key] = str(total_value)
+        if average_value > 0:
+            merged["summary"]["averages"][key] = str(int(average_value)) if float(average_value).is_integer() else f"{average_value:.2f}"
+            merged["instagram"][key] = merged["summary"]["averages"][key]
+
+    if reach_values:
+        avg_reach = round(sum(reach_values) / len(reach_values), 2)
+        merged["summary"]["totals"]["reach"] = str(max(reach_values))
+        merged["summary"]["averages"]["reach"] = str(int(avg_reach)) if float(avg_reach).is_integer() else f"{avg_reach:.2f}"
+        merged["instagram"]["reach"] = merged["summary"]["averages"]["reach"]
+
+    if engagement_rates:
+        merged["instagram"]["engagementRate"] = f"{round(sum(engagement_rates) / len(engagement_rates), 2)}%"
+
+    if media_types:
+        merged["mediaType"] = " + ".join(sorted(set(media_types)))
+
+    merged["brandName"] = _select_unique_brand_name(brand_candidates)
+
+    merged["creatorNames"] = list(dict.fromkeys(name for name in creator_names if name))
+    deduped_creator_entries = []
+    seen_creator_entry_keys = set()
+    for entry in creator_entries:
+        creator_key = ((entry.get("name") or "").strip().lower(), (entry.get("postUrl") or "").strip().lower())
+        if creator_key in seen_creator_entry_keys:
+            continue
+        seen_creator_entry_keys.add(creator_key)
+        deduped_creator_entries.append(entry)
+    merged["creatorEntries"] = deduped_creator_entries
+    merged["postUrls"] = list(dict.fromkeys(merged["postUrls"]))
+    has_metrics = any(merged["instagram"].get(k) for k in ["views", "likes", "comments", "shares", "saves", "reach", "impressions"])
+    has_metadata = any([
+        merged.get("brandName"),
+        merged.get("fullName"),
+        merged.get("username"),
+        merged.get("postImage"),
+        merged.get("videoUrl"),
+        merged.get("creatorEntries"),
+        merged.get("postUrls"),
+    ])
+    return merged if (has_metrics or has_metadata) else None
+
+
+def _infer_brand_from_post_record(record):
+    if not isinstance(record, dict):
+        return ""
+    candidates = [
+        _first_value(record, "brand", "brand_name", ("brand", "name"), ("sponsor", "name"), ("sponsored_by", "name")),
+        _first_value(record, ("coauthor_producers", 0, "username")),
+        _first_value(record, ("coauthor_producers", 0, "full_name")),
+        _first_value(record, "sponsor_user", "username"),
+        _first_value(record, "sponsor_user", "full_name"),
+        _first_value(record, ("edge_media_to_tagged_user", "edges", 0, "node", "user", "username")),
+        _first_value(record, ("edge_media_to_tagged_user", "edges", 0, "node", "user", "full_name")),
+    ]
+    return _select_unique_brand_name(candidates)
+
+
+def _infer_brand_logo_url_from_post_record(record):
+    if not isinstance(record, dict):
+        return ""
+    candidates = [
+        _first_value(record, ("coauthor_producers", 0, "profile_pic_url")),
+        _first_value(record, ("edge_media_to_tagged_user", "edges", 0, "node", "user", "profile_pic_url")),
+        _first_value(record, "brand_logo_url"),
+        _first_value(record, ("brand", "logo")),
+        _first_value(record, ("sponsor_user", "profile_pic_url")),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip().startswith("http"):
+            return candidate.strip()
+    return ""
+
+
 def _fetch_brightdata_records(urls, dataset_id, max_attempts=12, poll_delay=3):
     import requests as req
     import time
@@ -2781,7 +3687,7 @@ def _fetch_brightdata_records(urls, dataset_id, max_attempts=12, poll_delay=3):
 
 
 def fetch_instagram_post_data(post_url):
-    """Fetch exact metrics for a specific Instagram post/Reel from Bright Data."""
+    """Fetch exact metrics for a specific Instagram post/Reel from RapidAPI shortcode media endpoint."""
     import re
     cache_key = ("instagram_post", (post_url or "").strip())
     cached = _cache_get(cache_key)
@@ -2796,16 +3702,32 @@ def fetch_instagram_post_data(post_url):
         return None
 
     shortcode = match.group(1)
-    dataset_id = os.environ.get("BRIGHTDATA_INSTAGRAM_POST_DATASET_ID", "gd_lyclm20il4r5helnj").strip()
+    print(f"[INSTAGRAM] Parsed shortcode {shortcode} from URL: {post_url}")
     merged = {
         "mediaType": media_type,
         "source": "",
         "username": "",
         "fullName": "",
         "brandUsername": "",
+        "brandName": "",
+        "creatorNames": [],
         "postImage": "",
         "videoUrl": "",
+        "postTitle": "",
+        "captionText": "",
+        "hasMetrics": False,
+        "hasMetadata": False,
+        "postUrls": [post_url],
         "raw_data": {},
+        "urlStatus": {
+            "url": post_url,
+            "shortcode": shortcode,
+            "status": "pending",
+            "hasMetrics": False,
+            "hasMetadata": False,
+            "creator": "",
+            "brand": "",
+        },
         "instagram": {
             "views": "",
             "likes": "",
@@ -2826,11 +3748,11 @@ def fetch_instagram_post_data(post_url):
         if value not in (None, "") and not merged["instagram"].get(key):
             merged["instagram"][key] = str(value)
 
-    # Bright Data is the single source of truth for Instagram post metrics.
+    # RapidAPI shortcode media endpoint is the source of truth for Instagram post metrics.
     try:
-        records = _fetch_brightdata_records([post_url], dataset_id)
+        records = _fetch_rapidapi_instagram_media(shortcode)
     except Exception as e:
-        print(f"[WARNING] Bright Data dataset fetch failed: {e}")
+        print(f"[WARNING] RapidAPI media fetch failed: {e}")
         records = []
 
     for record in records:
@@ -2850,18 +3772,28 @@ def fetch_instagram_post_data(post_url):
         if record_url and shortcode not in str(record_url):
             continue
 
-        likes = _safe_int(_first_value(record, "like_count", "likes", ("post", "like_count"), ("node", "like_count")))
-        comments = _safe_int(_first_value(record, "comment_count", "comments_count", "comments", ("post", "comment_count"), ("node", "comment_count")))
-        views = _safe_int(_first_value(record, "video_play_count", "play_count", "video_view_count", "view_count", "views", ("post", "video_play_count"), ("post", "play_count"), ("post", "video_view_count"), ("node", "video_view_count")))
-        shares = _safe_int(_first_value(record, "share_count", "shares", ("post", "share_count")))
-        saves = _safe_int(_first_value(record, "save_count", "saves", ("post", "save_count")))
-        reach = _safe_int(_first_value(record, "reach", ("owner", "edge_followed_by", "count"), ("user", "follower_count")))
+        likes = _safe_int(_first_value(record, "like_count", "likes", ("metrics", "likes"), ("statistics", "likes"), ("post", "like_count"), ("node", "like_count"), ("edge_media_preview_like", "count")))
+        comments = _safe_int(_first_value(record, "comment_count", "comments_count", "comments", ("metrics", "comments"), ("statistics", "comments"), ("post", "comment_count"), ("node", "comment_count"), ("edge_media_to_parent_comment", "count"), ("edge_media_preview_comment", "count")))
+        views = _safe_int(_first_value(record, "video_play_count", "play_count", "video_view_count", "view_count", "views", ("metrics", "views"), ("statistics", "views"), ("post", "video_play_count"), ("post", "play_count"), ("post", "video_view_count"), ("node", "video_view_count")))
+        shares = _safe_int(_first_value(record, "share_count", "shares", ("metrics", "shares"), ("statistics", "shares"), ("post", "share_count")))
+        saves = _safe_int(_first_value(record, "save_count", "saves", ("metrics", "saves"), ("statistics", "saves"), ("post", "save_count")))
+        reach = _safe_int(_first_value(record, "reach", ("owner", "edge_followed_by", "count"), ("user", "follower_count"), ("owner", "follower_count")))
         impressions = _safe_int(_first_value(record, "impressions", ("post", "impressions")))
-        username = _first_value(record, ("owner", "username"), ("user", "username"), "username", ("post", "owner_username")) or ""
-        full_name = _first_value(record, ("owner", "full_name"), ("user", "full_name"), "full_name", ("post", "owner_full_name")) or ""
-        engagement_rate = _first_value(record, "engagement_rate", ("post", "engagement_rate")) or ""
+        username = _first_value(record, ("owner", "username"), ("user", "username"), "username", ("author", "username"), ("post", "owner_username")) or ""
+        full_name = _first_value(record, ("owner", "full_name"), ("user", "full_name"), "full_name", ("author", "full_name"), ("post", "owner_full_name")) or ""
+        engagement_rate = _first_value(record, "engagement_rate", ("metrics", "engagement_rate"), ("post", "engagement_rate")) or ""
+        post_title = _first_value(record, "title", ("post", "title"), ("node", "title")) or ""
+        caption_text = _first_value(
+            record,
+            "caption",
+            ("post", "caption"),
+            ("node", "caption"),
+            ("edge_media_to_caption", "edges", 0, "node", "text"),
+        ) or ""
         post_image = _first_value(
             record,
+            ("display_resources", -1, "src"),
+            ("node", "display_resources", -1, "src"),
             "display_url",
             "displayUrl",
             "image_url",
@@ -2902,11 +3834,25 @@ def fetch_instagram_post_data(post_url):
             _fill_instagram_field("engagementRate", engagement_rate)
         _fill_post_field("username", username)
         _fill_post_field("fullName", full_name)
+        if full_name:
+            merged["creatorNames"] = [full_name]
+        elif username:
+            merged["creatorNames"] = [username]
+        if not merged.get("brandName"):
+            merged["brandName"] = _infer_brand_from_post_record(record)
+        if not merged.get("brandLogo"):
+            merged["brandLogo"] = _infer_brand_logo_url_from_post_record(record)
         _fill_post_field("postImage", post_image)
         _fill_post_field("videoUrl", video_url)
-        merged["source"] = merged["source"] or "brightdata_post_dataset"
-        merged["raw_data"]["brightdata_post_dataset"] = record
-        print(f"[OK] Bright Data post data found for shortcode {shortcode}")
+        _fill_post_field("postTitle", post_title)
+        _fill_post_field("captionText", caption_text)
+        merged["source"] = merged["source"] or "rapidapi_shortcode_media"
+        merged["raw_data"]["rapidapi_shortcode_media"] = record
+        print(
+            f"[OK] RapidAPI post data found for shortcode {shortcode} | "
+            f"creator={full_name or username or 'n/a'} | "
+            f"likes={likes} | comments={comments} | views={views} | reach={reach}"
+        )
         break
 
     # Compute a lightweight public engagement rate when we have enough public data.
@@ -2921,8 +3867,30 @@ def fetch_instagram_post_data(post_url):
             pass
 
     has_metrics = any(merged["instagram"].get(k) for k in ["views", "likes", "comments", "shares", "saves", "reach", "impressions"])
-    if not has_metrics:
-        print("[WARNING] No usable Instagram post metrics returned from Bright Data")
+    has_metadata = any([
+        merged.get("username"),
+        merged.get("fullName"),
+        merged.get("brandName"),
+        merged.get("brandLogo"),
+        merged.get("postImage"),
+        merged.get("videoUrl"),
+        merged.get("postTitle"),
+        merged.get("captionText"),
+    ])
+    merged["hasMetrics"] = has_metrics
+    merged["hasMetadata"] = has_metadata
+    merged["urlStatus"] = {
+        "url": post_url,
+        "shortcode": shortcode,
+        "status": "metrics" if has_metrics else ("metadata_only" if has_metadata else "failed"),
+        "hasMetrics": has_metrics,
+        "hasMetadata": has_metadata,
+        "creator": merged.get("fullName") or merged.get("username") or "",
+        "brand": _select_unique_brand_name([merged.get("brandName")]) or "",
+    }
+    print(f"[INSTAGRAM] URL status for {shortcode}: {merged['urlStatus']}")
+    if not has_metrics and not has_metadata:
+        print("[WARNING] No usable Instagram post metrics or metadata returned from RapidAPI")
         return None
 
     _cache_set(cache_key, merged)
@@ -3078,6 +4046,70 @@ def proxy_media():
         return Response(resp.content, content_type=content_type)
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 502
+
+
+@app.route('/api/template-preview', methods=['GET'])
+def get_template_preview():
+    """Return latest PNG previews for the local PPT template."""
+    try:
+        preview_data = export_template_preview_images()
+        return jsonify({"success": True, **preview_data})
+    except Exception as e:
+        print(f"[ERROR] Template preview export failed: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/template-preview/image/<filename>', methods=['GET'])
+def get_template_preview_image(filename):
+    """Serve one exported template slide preview image."""
+    try:
+        safe_name = os.path.basename(filename)
+        if safe_name != filename or not re.fullmatch(r"Slide\d+\.PNG", safe_name, re.IGNORECASE):
+            return jsonify({"success": False, "error": "Invalid preview filename"}), 400
+
+        image_path = os.path.join(PREVIEW_DIR, safe_name)
+        if not os.path.exists(image_path):
+            return jsonify({"success": False, "error": "Preview image not found"}), 404
+
+        return send_file(image_path, mimetype='image/png')
+    except Exception as e:
+        print(f"[ERROR] Error serving preview image: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/report-preview/<filename>', methods=['GET'])
+def get_report_preview(filename):
+    """Return latest PNG previews for a generated PPTX report."""
+    try:
+        preview_data = export_report_preview_images(filename)
+        return jsonify({"success": True, **preview_data})
+    except Exception as e:
+        print(f"[ERROR] Report preview export failed: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/report-preview/image/<report_key>/<filename>', methods=['GET'])
+def get_report_preview_image(report_key, filename):
+    """Serve one exported generated-report preview image."""
+    try:
+        safe_key = os.path.basename(report_key)
+        safe_name = os.path.basename(filename)
+        if (
+            safe_key != report_key
+            or safe_name != filename
+            or not re.fullmatch(r"[A-Za-z0-9_.-]+", safe_key)
+            or not re.fullmatch(r"Slide\d+\.PNG", safe_name, re.IGNORECASE)
+        ):
+            return jsonify({"success": False, "error": "Invalid preview path"}), 400
+
+        image_path = os.path.join(REPORT_PREVIEW_ROOT, safe_key, safe_name)
+        if not os.path.exists(image_path):
+            return jsonify({"success": False, "error": "Preview image not found"}), 404
+
+        return send_file(image_path, mimetype='image/png')
+    except Exception as e:
+        print(f"[ERROR] Error serving generated preview image: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route('/api/download/<filename>')

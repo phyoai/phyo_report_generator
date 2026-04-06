@@ -20,10 +20,14 @@ function App() {
     };
   }, []);
   const [prompt, setPrompt] = useState('');
-  const [instagramPostUrl, setInstagramPostUrl] = useState('');
+  const [contentUrls, setContentUrls] = useState(['', '', '']);
+  const [budgetInrValues, setBudgetInrValues] = useState(['', '', '']);
   const [images, setImages] = useState([]);
   const [previews, setPreviews] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [templatePreview, setTemplatePreview] = useState(null);
+  const [generatedPreview, setGeneratedPreview] = useState(null);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
 
@@ -32,6 +36,49 @@ function App() {
       previews.forEach((url) => URL.revokeObjectURL(url));
     };
   }, [previews]);
+
+  const loadTemplatePreview = async () => {
+    setPreviewLoading(true);
+
+    try {
+      const res = await fetch(`${apiUrl}/api/template-preview`);
+      const data = await res.json();
+
+      if (data.success) {
+        setTemplatePreview(data);
+      }
+    } catch (err) {
+      console.error('Template preview failed:', err);
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadTemplatePreview();
+  }, []);
+
+  const loadGeneratedPreview = async (filename) => {
+    if (!filename) {
+      setGeneratedPreview(null);
+      return;
+    }
+
+    setPreviewLoading(true);
+
+    try {
+      const res = await fetch(`${apiUrl}/api/report-preview/${encodeURIComponent(filename)}`);
+      const data = await res.json();
+
+      if (data.success) {
+        setGeneratedPreview(data);
+      }
+    } catch (err) {
+      console.error('Generated report preview failed:', err);
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
 
   const handleImageUpload = (e) => {
     const files = Array.from(e.target.files);
@@ -58,7 +105,10 @@ function App() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     
-    if (!prompt.trim() && images.length === 0 && !instagramPostUrl.trim()) {
+    const combinedUrls = contentUrls.map((url) => url.trim()).filter(Boolean).join('\n');
+    const submittedUrls = contentUrls.map((url) => url.trim()).filter(Boolean);
+
+    if (!prompt.trim() && images.length === 0 && !combinedUrls) {
       setError('Please provide a prompt, images, or a post URL');
       return;
     }
@@ -70,14 +120,17 @@ function App() {
     try {
       const formData = new FormData();
       formData.append('prompt', prompt);
-      if (instagramPostUrl.trim()) {
-        const url = instagramPostUrl.trim();
-        if (url.includes('youtube.com') || url.includes('youtu.be')) {
-          formData.append('youtube_post_url', url);
-        } else {
-          formData.append('instagram_post_url', url);
-        }
+      formData.append(
+        'budget_inr_values',
+        JSON.stringify(budgetInrValues.map((value) => value.trim()))
+      );
+      if (combinedUrls) {
+        formData.append('instagram_post_url', combinedUrls);
       }
+
+      console.log('[URL SUBMIT] Content URL slots:', contentUrls);
+      console.log('[URL SUBMIT] Final submitted URLs:', submittedUrls);
+      console.log('[URL SUBMIT] Final combined payload:', combinedUrls);
 
       // Append each image individually
       images.forEach((img, index) => {
@@ -96,6 +149,7 @@ function App() {
 
       if (data.success) {
         setResult(data);
+        await loadGeneratedPreview(data.filename);
       } else {
         setError(data.error || 'Failed to generate report');
       }
@@ -106,196 +160,112 @@ function App() {
     }
   };
 
-  // const downloadReport = () => {
-  //   if (result?.filename) {
-  //     window.open(`http://localhost:5000/api/download/${result.filename}`, '_blank');
-  //   }
-  // };
-
   const resetForm = () => {
     setPrompt('');
-    setInstagramPostUrl('');
+    setContentUrls(['', '', '']);
+    setBudgetInrValues(['', '', '']);
     setImages([]);
     setPreviews([]);
+    setGeneratedPreview(null);
     setResult(null);
     setError(null);
   };
 
+  const activePreview = generatedPreview || templatePreview;
+  const previewTitle = generatedPreview ? 'Generated PPT Preview' : 'PPT Template Preview';
+  const previewHeadline = generatedPreview ? 'Latest generated deck' : 'Presentation template library';
+  const previewNote = generatedPreview
+    ? 'This preview reflects the latest generated PPTX report with refreshed slide visuals.'
+    : 'Edit `backend/Campaign_Report_PyroMedia.pptx`, save it, then refresh this preview.';
+  const refreshPreview = generatedPreview?.slides?.length && result?.filename
+    ? () => loadGeneratedPreview(result.filename)
+    : loadTemplatePreview;
+
   return (
     <div className="report-app min-h-screen w-full relative overflow-x-hidden">
-      {/* Background pattern */}
       <div className="report-pattern fixed inset-0 w-full h-full opacity-50 pointer-events-none">
         <div className="absolute inset-0 w-full h-full transform rotate-45"></div>
         <div className="absolute inset-0 w-full h-full"></div>
       </div>
       
       <div className="w-full min-h-screen flex flex-col relative z-10">
-        <div className="container mx-auto px-3 sm:px-4 py-4 sm:py-6 md:py-8 flex-1">
+        <div className="container mx-auto px-3 sm:px-4 py-3 sm:py-5 md:py-6 flex-1">
           <div className="max-w-5xl mx-auto">
-            {/* Glassmorphism container */}
             <div className="report-shell backdrop-blur-xl rounded-2xl sm:rounded-3xl p-4 sm:p-6 md:p-8 lg:p-10">
-            
-            {/* Header */}
-            <div className="report-hero mb-6 sm:mb-8 md:mb-10">
-              <h1 className="report-title report-heading">
-                Campaign Report
-                <span className="report-heading-accent">Generator</span>
-              </h1>
-              <p className="report-subtitle report-lead text-sm sm:text-base md:text-lg leading-relaxed px-2">
-                Turn campaign screenshots, reels, and dashboards into polished presentation-ready reports in minutes.
-              </p>
-            </div>
-
-            {/* Form */}
-            <form onSubmit={handleSubmit} className="space-y-4 sm:space-y-6 md:space-y-8">
-              
-              {/* Prompt Input */}
-              <div className="report-section space-y-2 sm:space-y-3">
-                <div className="report-section-title">Campaign Brief</div>
-                <label className="report-label block text-sm sm:text-base font-semibold mb-2">
-                  Campaign Description
-                </label>
-                <textarea
-                  value={prompt}
-                  onChange={(e) => setPrompt(e.target.value)}
-                  placeholder="Example: Create report for summer fashion campaign with Influencer X, budget $5000, ran June 1-30. Include Instagram and YouTube metrics."
-                  rows="3"
-                  disabled={loading}
-                  className="report-input w-full px-3 py-2 sm:px-4 sm:py-3 rounded-lg sm:rounded-xl text-sm sm:text-base resize-none disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200"
+            <div className="report-hero report-hero-compact mb-4 sm:mb-5 md:mb-6">
+              <div className="report-hero-logo-shell">
+                <img
+                  src="/pyromedia-logo.png"
+                  alt="PyroMedia logo"
+                  className="report-hero-logo"
                 />
               </div>
+              <h5 className="report-hero-subhead">Report Generator</h5>
+            </div>
 
-              {/* Instagram / YouTube Post URL */}
-              <div className="report-section space-y-2">
-                <div className="report-section-title">Content Source</div>
-                <label className="report-label block text-sm sm:text-base font-semibold mb-1">
-                  Post / Reel / YouTube Video URL
-                </label>
-                <div className="report-dropzone flex items-center rounded-lg sm:rounded-xl overflow-hidden transition-all duration-200">
-                  <span className="pl-3 report-muted select-none">
-                    <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
-                    </svg>
-                  </span>
-                  <input
-                    type="url"
-                    value={instagramPostUrl}
-                    onChange={(e) => setInstagramPostUrl(e.target.value)}
-                    placeholder="https://www.instagram.com/reel/ABC123/"
-                    disabled={loading}
-                    className="flex-1 px-3 py-2 sm:py-3 bg-transparent report-title text-sm sm:text-base focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
-                  />
-                </div>
-                <p className="report-faint text-xs">Paste the link to the reel, post, or YouTube video to auto-fetch exact metrics (likes, views, comments)</p>
-              </div>
-
-              {/* Image Upload */}
-              <div className="report-section space-y-2 sm:space-y-3">
-                <div className="report-section-title">Visual Inputs</div>
-                <label className="report-label block text-sm sm:text-base font-semibold mb-2">
-                  Upload Screenshots ({images.length} selected)
-                </label>
-                {/* What to upload guide */}
-                {/* <div className="report-alert-info backdrop-blur-md rounded-lg p-3 mb-2">
-                  <p className="token-info text-xs font-semibold mb-2">What to upload for exact metrics:</p>
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs report-subtitle">
-                    <div className="flex gap-2 items-start">
-                      <span className="token-primary text-base">1.</span>
-                      <div>
-                        <p className="font-semibold report-title">Instagram Insights</p>
-                        <p>Open Reel -> tap <span className="token-primary-soft font-mono">...</span> -> <span className="token-primary-soft">View Insights</span> -> screenshot</p>
-                        <p className="report-faint mt-0.5">Shows: Plays, Reach, Likes, Saves, Shares</p>
-                      </div>
-                    </div>
-                    <div className="flex gap-2 items-start">
-                      <span className="token-error text-base">2.</span>
-                      <div>
-                        <p className="font-semibold report-title">YouTube Analytics</p>
-                        <p>YouTube Studio -> Video -> <span className="token-error">Analytics</span> -> screenshot</p>
-                        <p className="report-faint mt-0.5">Shows: Views, Watch time, CTR</p>
-                      </div>
-                    </div>
-                    <div className="flex gap-2 items-start">
-                      <span className="token-accent text-base">3.</span>
-                      <div>
-                        <p className="font-semibold report-title">Campaign dashboard</p>
-                        <p>Any tool showing campaign numbers (Cloutflow, Phyllo, etc.)</p>
-                        <p className="report-faint mt-0.5">All visible numbers extracted automatically</p>
-                      </div>
-                    </div>
-                  </div>
-                </div> */}
-                <div className="relative">
-                  <input
-                    type="file"
-                    multiple
-                    accept="image/*"
-                    onChange={handleImageUpload}
-                    disabled={loading}
-                    className="report-dropzone w-full px-3 py-4 sm:px-4 sm:py-6 rounded-lg sm:rounded-xl cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 transition-all duration-200 report-title text-sm sm:text-base file:mr-2 sm:file:mr-4 file:py-1 sm:file:py-2 file:px-2 sm:file:px-4 file:rounded file:border-0 file:text-xs sm:file:text-sm file:font-semibold file:bg-[var(--brand-primary)] file:text-[var(--brand-ink)] hover:file:bg-[var(--brand-secondary)]"
-                  />
-                  <div className="report-upload-copy">
-                    <div className="report-upload-icon">
-                      <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 0115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-                      </svg>
-                    </div>
-                    <div className="report-upload-title">Drop files here or browse</div>
-                    <div className="report-upload-subtitle">Insights screenshots, creator content, logo, and dashboards</div>
-                  </div>
-                </div>
-                <p className="report-subtitle text-xs sm:text-sm mt-1 sm:mt-2 leading-relaxed">
-                  Upload campaign photos, metrics screenshots, brand logo, and creator content. You can select multiple files at once or add more later.
-                </p>
-              </div>
-
-              {/* Image Previews */}
-              {previews.length > 0 && (
-                <div className="report-panel backdrop-blur-md p-3 sm:p-4 md:p-6 rounded-lg sm:rounded-xl">
-                  <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center mb-3 sm:mb-4 gap-2">
-                    <h3 className="font-semibold report-title text-sm sm:text-base md:text-lg">
-                      Uploaded Images ({previews.length})
-                    </h3>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setImages([]);
-                        setPreviews([]);
-                      }}
-                      className="text-xs sm:text-sm font-medium transition-colors duration-200 self-start sm:self-auto text-[var(--brand-secondary)] hover:text-[var(--text-primary)]"
-                    >
-                      Clear All
-                    </button>
-                  </div>
-                  <div className="report-preview-grid">
-                    {previews.map((url, idx) => (
-                      <div key={idx} className="report-preview-card relative group">
-                        <img
-                          src={url}
-                          alt={`Preview ${idx + 1}`}
-                          className="w-full h-16 sm:h-20 md:h-24 object-cover rounded border border-[var(--border-subtle)] group-hover:border-[var(--brand-secondary)] transition-all duration-200"
-                        />
-                        <span className="absolute bottom-0.5 left-0.5 sm:bottom-1 sm:left-1 report-chip backdrop-blur-sm text-[var(--text-primary)] text-xs px-1.5 py-0.5 rounded text-center">
-                          {idx + 1}
+            <form onSubmit={handleSubmit} className="space-y-4 sm:space-y-5 md:space-y-6">
+              
+              <div className="report-form-grid">
+                <div className="report-section report-form-grid-main space-y-2">
+                  <div className="report-section-title">Content Source</div>
+                  <label className="report-label block text-sm sm:text-base font-semibold mb-1">
+                    Post / Reel / Video URLs
+                  </label>
+                  <div className="report-url-grid">
+                    {contentUrls.map((url, index) => (
+                      <div key={`content-url-${index}`} className="report-dropzone report-url-slot flex items-center rounded-lg sm:rounded-xl overflow-hidden transition-all duration-200">
+                        <span className="pl-3 report-muted select-none report-url-slot-index">
+                          {index + 1}
                         </span>
-                        <button
-                          type="button"
-                          onClick={() => removeImage(idx)}
-                          className="absolute top-0.5 right-0.5 sm:top-1 sm:right-1 bg-[var(--brand-primary)] backdrop-blur-sm text-[var(--brand-ink)] rounded-full w-5 h-5 sm:w-6 sm:h-6 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all duration-200 text-xs"
-                          title="Remove image"
-                        >
-                          ×
-                        </button>
+                        <input
+                          type="text"
+                          value={url}
+                          onChange={(e) => {
+                            const nextUrls = [...contentUrls];
+                            nextUrls[index] = e.target.value;
+                            setContentUrls(nextUrls);
+                          }}
+                          placeholder={`Paste URL ${index + 1}`}
+                          disabled={loading}
+                          className="flex-1 px-3 py-2 sm:py-3 bg-transparent report-title text-sm sm:text-base focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
+                        />
                       </div>
                     ))}
                   </div>
+                  <p className="report-faint text-xs">Paste up to 3 links to combine them into one report. Instagram metrics will be merged across all valid URLs that return data.</p>
                 </div>
-              )}
 
-              {/* Submit Button */}
+                <div className="report-section report-form-grid-side space-y-2">
+                  <div className="report-section-title">Campaign Budget</div>
+                  <div className="report-budget-grid">
+                    {budgetInrValues.map((budgetValue, index) => (
+                      <div key={`budget-slot-${index}`} className="report-budget-row report-budget-row-compact">
+                        <span className="report-budget-prefix">URL {index + 1}</span>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          value={budgetValue}
+                          onChange={(e) => {
+                            const nextBudgets = [...budgetInrValues];
+                            nextBudgets[index] = e.target.value;
+                            setBudgetInrValues(nextBudgets);
+                          }}
+                          placeholder={contentUrls[index]?.trim() ? "Enter budget" : "Add URL first"}
+                          disabled={loading || !contentUrls[index]?.trim()}
+                          className="report-input report-budget-input w-full px-3 py-2 sm:py-3 rounded-lg sm:rounded-xl text-sm sm:text-base focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                  <p className="report-faint text-xs">Add only the budgets you want to use for URL-wise calculations.</p>
+                </div>
+              </div>
+              
+              
               <button
                 type="submit"
-                disabled={loading || (!prompt.trim() && images.length === 0 && !instagramPostUrl.trim())}
+                disabled={loading || (!prompt.trim() && images.length === 0 && !contentUrls.some((url) => url.trim()) && !budgetInrValues.some((value) => value.trim()))}
                 className="report-button-primary w-full font-semibold py-3 sm:py-4 px-4 sm:px-6 rounded-lg sm:rounded-xl disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-300 flex items-center justify-center gap-2 sm:gap-3 shadow-lg hover:shadow-xl backdrop-blur-sm transform hover:scale-[1.01] sm:hover:scale-[1.02] active:scale-[0.99] sm:active:scale-[0.98]"
               >
                 {loading ? (
@@ -311,8 +281,6 @@ function App() {
                 )}
               </button>
             </form>
-
-            {/* Error Alert */}
             {error && (
               <div className="report-alert-danger mt-4 sm:mt-6 backdrop-blur-md p-3 sm:p-4 rounded-lg sm:rounded-xl">
                 <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-0">
@@ -321,47 +289,20 @@ function App() {
                 </div>
               </div>
             )}
-
-            {/* Success Result */}
             {result && (
               <div className="mt-4 sm:mt-6 space-y-3 sm:space-y-4 md:space-y-6">
-                <div className="report-alert-success backdrop-blur-md p-3 sm:p-4 rounded-lg sm:rounded-xl">
-                  <p className="font-semibold text-sm sm:text-base md:text-lg">
-                    Report generated successfully!
-                  </p>
-                </div>
 
-                {/* Warnings — e.g. Instagram URL blocked */}
-                {result.warnings && result.warnings.length > 0 && (
-                  <div className="space-y-2">
-                    {result.warnings.map((w, i) => (
-                      <div key={i} className="report-alert-warning backdrop-blur-md p-3 sm:p-4 rounded-lg sm:rounded-xl flex gap-3">
-                        <span className="token-warning text-lg shrink-0">!</span>
-                        <div>
-                          <p className="text-sm sm:text-base">{w}</p>
-                          <p className="text-xs mt-1 opacity-80">
-                            <strong>How to fix:</strong> Go to Instagram → open the Reel → tap "View Insights" → screenshot that screen → upload it here.
-                          </p>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {/* Extracted Data */}
+                
                 <div className="report-panel backdrop-blur-md p-3 sm:p-4 md:p-6 rounded-lg sm:rounded-xl">
                   <h2 className="report-title text-lg sm:text-xl md:text-2xl font-bold mb-3 sm:mb-4 md:mb-6">
                     Extracted Data
                   </h2>
-
-                  {/* helper: show value only if non-empty and non-zero */}
                   {(() => {
                     const d = result.extracted_data;
                     const val = (v) => (!v || v === '0' || v === 0) ? '' : v;
 
                     return (
                   <div className="space-y-3 sm:space-y-4 md:space-y-6">
-                    {/* Campaign Info */}
                     <div className="report-panel-strong backdrop-blur-sm p-3 sm:p-4 rounded-lg sm:rounded-xl border-l-4 border-l-[var(--brand-primary)]">
                       <h3 className="report-title font-bold text-base sm:text-lg md:text-xl mb-1 sm:mb-2">
                         {val(d.campaignName) || 'Campaign Report'}
@@ -375,37 +316,7 @@ function App() {
                       </div>
                     </div>
 
-                    {(val(d.postImage) || val(d.videoUrl)) && (
-                      <div className="report-panel-soft backdrop-blur-sm p-3 sm:p-4 rounded-lg sm:rounded-xl">
-                        <h4 className="report-title font-semibold mb-2 sm:mb-3 text-sm sm:text-base md:text-lg">
-                          URL Media
-                        </h4>
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 sm:gap-4">
-                          {val(d.postImage) && (
-                            <div className="report-chip media-frame p-2 sm:p-3 rounded">
-                              <div className="report-subtitle text-xs sm:text-sm mb-2">Post Image</div>
-                              <img
-                                src={proxiedMediaUrl(d.postImage)}
-                                alt="Instagram post"
-                                className="w-full h-48 object-cover rounded-lg border border-[var(--border-subtle)]"
-                              />
-                            </div>
-                          )}
-                          {/* {val(d.videoUrl) && (
-                            <div className="report-chip media-frame p-2 sm:p-3 rounded">
-                              <div className="report-subtitle text-xs sm:text-sm mb-2">Video Preview</div>
-                              <video
-                                src={proxiedMediaUrl(d.videoUrl)}
-                                controls
-                                className="w-full h-48 object-cover rounded-lg border border-[var(--border-subtle)]"
-                              />
-                            </div>
-                          )} */}
-                        </div>
-                      </div>
-                    )}
 
-                    {/* Overall Metrics */}
                     <div className="report-panel-soft backdrop-blur-sm p-3 sm:p-4 rounded-lg sm:rounded-xl">
                       <h4 className="report-title font-semibold mb-2 sm:mb-3 text-sm sm:text-base md:text-lg">
                         Overall Campaign Metrics
@@ -437,6 +348,26 @@ function App() {
                           <p className="report-subtitle mt-1 text-xs sm:text-sm leading-relaxed">{d.performance.keyLearnings}</p>
                         </div>
                       )}
+                      {d.creators && d.creators.length > 1 && (
+                        <div className="report-chip mt-3 sm:mt-4 p-2 sm:p-3 rounded">
+                          <span className="font-semibold report-title text-sm sm:text-base">Creators Included:</span>
+                          <div className="report-creator-grid mt-2">
+                            {d.creators.map((creatorItem, idx) => (
+                              <div key={`${creatorItem.name || 'creator'}-${idx}`} className="report-creator-card">
+                                <div className="report-title font-semibold text-sm">{creatorItem.name || `Creator ${idx + 1}`}</div>
+                                <div className="report-subtitle text-xs mt-1">
+                                  {[
+                                    creatorItem.views ? `Views ${creatorItem.views}` : '',
+                                    creatorItem.likes ? `Likes ${creatorItem.likes}` : '',
+                                    creatorItem.comments ? `Comments ${creatorItem.comments}` : '',
+                                    creatorItem.reach ? `Reach ${creatorItem.reach}` : '',
+                                  ].filter(Boolean).join(' | ') || 'Metadata captured'}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                       {[
                         ['CPC Goal',        val(d.financial?.cpcGoal)],
                         ['CPV Goal',        val(d.financial?.cpvGoal)],
@@ -458,8 +389,6 @@ function App() {
                         </div>
                       )}
                     </div>
-
-                    {/* Creator Data */}
                     {d.creators && d.creators.length > 0 && (
                       <div className="space-y-3 sm:space-y-4">
                         {d.creators.map((creator, idx) => (
@@ -515,10 +444,7 @@ function App() {
                   );
                   })()}
                 </div>
-
-                {/* Action Buttons */}
                 <div className="flex flex-col gap-3 sm:gap-4">
-                  {/* Google Slides Link */}
                   {result.google_slides_link && (
                     <a
                       href={result.google_slides_link}
@@ -532,8 +458,6 @@ function App() {
                       <span className="text-sm sm:text-base md:text-lg">Open in Google Slides</span>
                     </a>
                   )}
-
-                  {/* New Report Button */}
                   <div className="flex justify-center">
                     <button
                       onClick={resetForm}
