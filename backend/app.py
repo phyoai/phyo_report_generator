@@ -11,6 +11,7 @@ from pptx.enum.text import MSO_AUTO_SIZE, PP_ALIGN
 from pptx.dml.color import RGBColor
 from anthropic import Anthropic
 import os
+import sys
 import base64
 import io
 import json
@@ -167,6 +168,14 @@ def _export_presentation_preview_images(pptx_path, preview_dir, image_url_builde
             os.remove(os.path.join(preview_dir, name))
         except PermissionError:
             print(f"[WARNING] Could not remove locked preview image: {name}")
+
+    if os.name != 'nt' or shutil.which("powershell") is None:
+        print("[WARNING] PPT preview export is unavailable in this environment; returning empty preview set")
+        return {
+            updated_at_key: datetime.fromtimestamp(source_mtime).isoformat(),
+            "slides": [],
+            "warning": "Presentation preview rendering is unavailable on this server environment.",
+        }
 
     preview_dir_ps = _ps_quote(preview_dir)
     template_path_ps = _ps_quote(pptx_path)
@@ -2159,6 +2168,7 @@ def populate_powerpoint(data, images):
             return selected, selected_indices
         
         # SLIDE 1: Insert Brand Logo
+        hero_image_stream = None
         if len(prs.slides) > 0:
             slide_1 = prs.slides[0]
             
@@ -2234,9 +2244,64 @@ def populate_powerpoint(data, images):
                     width = logo_placeholder.width
                     height = logo_placeholder.height
                     _remove_shape(logo_placeholder)
-                    brand_fallback = slide_1.shapes.add_textbox(left, top, width, height)
-                    _set_title_text(brand_fallback, _clean_text(data.get('brand') or 'Brand'), align=PP_ALIGN.LEFT, italic=False)
                 print("[WARNING]  No brand logo image classified in uploaded images")
+
+            slide_1_image_streams, _ = _select_uploaded_streams(
+                preferred_types=['campaign_photo', 'creator_content'],
+                limit=1,
+                fallback_any=False,
+            )
+            if not slide_1_image_streams:
+                slide_1_image_url = ""
+                for creator_item in data.get("creators", []) or []:
+                    if not isinstance(creator_item, dict):
+                        continue
+                    slide_1_image_url = (creator_item.get("postImage") or "").strip()
+                    if slide_1_image_url:
+                        break
+                if not slide_1_image_url:
+                    slide_1_image_url = (data.get("postImage") or "").strip()
+                if slide_1_image_url:
+                    fallback_slide_1_image = _download_image_stream(slide_1_image_url)
+                    if fallback_slide_1_image:
+                        slide_1_image_streams.append(fallback_slide_1_image)
+
+            if slide_1_image_streams:
+                hero_image_stream = slide_1_image_streams[0]
+                for shape in list(slide_1.shapes):
+                    if shape.shape_type == 1 and getattr(shape, 'top', 0) > 2400000:
+                        _remove_shape(shape)
+                _add_picture_with_fallback(
+                    slide_1,
+                    hero_image_stream,
+                    default_box={
+                        'left': 1650000,
+                        'top': 2500000,
+                        'width': 5400000,
+                        'height': 2350000,
+                        'rotation': 0,
+                    }
+                )
+                print("[OK] Added dynamic campaign image to Slide 1")
+
+        # SLIDE 2: Add dynamic campaign image similar to the opening hero treatment
+        if len(prs.slides) > 1 and hero_image_stream:
+            slide_2 = prs.slides[1]
+            for shape in list(slide_2.shapes):
+                if shape.shape_type == 1 and getattr(shape, 'left', 0) < 3600000 and getattr(shape, 'top', 0) > 900000:
+                    _remove_shape(shape)
+            _add_picture_with_fallback(
+                slide_2,
+                hero_image_stream,
+                default_box={
+                    'left': 250000,
+                    'top': 1250000,
+                    'width': 3600000,
+                    'height': 2900000,
+                    'rotation': 0,
+                }
+            )
+            print("[OK] Added dynamic campaign image to Slide 2")
         
         # SLIDE 3: Campaign Name with proper styling
         if len(prs.slides) > 2:
@@ -2540,6 +2605,228 @@ def home():
     })
 
 
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health/debug endpoint for deployment verification without exposing secrets."""
+    return jsonify({
+        "success": True,
+        "status": "ok",
+        "runtime": {
+            "platform": os.name,
+            "python_version": sys.version.split()[0],
+            "preview_export_supported": os.name == 'nt' and shutil.which("powershell") is not None,
+            "using_openrouter": USE_OPENROUTER,
+        },
+        "env": {
+            "rapidapi_key_present": bool(os.environ.get("RAPIDAPI_KEY", "").strip()),
+            "rapidapi_host_present": bool(os.environ.get("RAPIDAPI_HOST", "").strip()),
+            "rapidapi_instagram_media_url_present": bool(os.environ.get("RAPIDAPI_INSTAGRAM_MEDIA_URL", "").strip()),
+            "openrouter_api_key_present": bool(os.environ.get("OPENROUTER_API_KEY", "").strip()),
+            "anthropic_api_key_present": bool(os.environ.get("ANTHROPIC_API_KEY", "").strip()),
+            "brightdata_api_token_present": bool(
+                os.environ.get("BRIGHTDATA_API_TOKEN", "").strip()
+                or os.environ.get("BRIGHTDATA_API_KEY", "").strip()
+            ),
+        },
+    })
+
+
+@app.route('/api/openapi.json', methods=['GET'])
+def openapi_spec():
+    """Minimal OpenAPI spec for interactive backend docs."""
+    server_url = request.host_url.rstrip('/')
+    spec = {
+        "openapi": "3.0.3",
+        "info": {
+            "title": "Phyo Report Generator API",
+            "version": "1.0.0",
+            "description": "Interactive docs for the campaign report generator backend.",
+        },
+        "servers": [{"url": server_url}],
+        "paths": {
+            "/api/health": {
+                "get": {
+                    "summary": "Health check",
+                    "responses": {
+                        "200": {
+                            "description": "Deployment/runtime health information",
+                        }
+                    },
+                }
+            },
+            "/api/prompt-presets": {
+                "get": {
+                    "summary": "Get prompt presets",
+                    "responses": {"200": {"description": "Prompt templates"}},
+                }
+            },
+            "/api/build-prompt": {
+                "post": {
+                    "summary": "Build prompt from template",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "template": {"type": "string", "example": "master"},
+                                        "data": {"type": "object"},
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {"description": "Prompt built successfully"},
+                        "400": {"description": "Invalid template"},
+                    },
+                }
+            },
+            "/api/generate-report": {
+                "post": {
+                    "summary": "Generate campaign report",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "multipart/form-data": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "prompt": {"type": "string"},
+                                        "instagram_post_url": {"type": "string", "description": "One or more URLs separated by new lines"},
+                                        "budget_inr_values": {
+                                            "type": "string",
+                                            "description": "JSON string array like [\"10000\",\"20000\",\"\"]",
+                                            "example": "[\"10000\",\"20000\",\"\"]"
+                                        },
+                                        "images": {
+                                            "type": "array",
+                                            "items": {"type": "string", "format": "binary"},
+                                        },
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {"description": "Report generated"},
+                        "400": {"description": "Missing input"},
+                    },
+                }
+            },
+            "/api/get-instagram-data": {
+                "get": {
+                    "summary": "Fetch Instagram profile data",
+                    "parameters": [
+                        {"name": "username", "in": "query", "schema": {"type": "string"}},
+                        {"name": "url", "in": "query", "schema": {"type": "string"}},
+                    ],
+                    "responses": {
+                        "200": {"description": "Instagram profile fetched"},
+                        "400": {"description": "Missing username/url"},
+                    },
+                },
+                "post": {
+                    "summary": "Fetch Instagram profile data",
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "username": {"type": "string"},
+                                        "url": {"type": "string"},
+                                    },
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {"description": "Instagram profile fetched"},
+                    },
+                },
+            },
+            "/api/proxy-media": {
+                "get": {
+                    "summary": "Proxy remote media",
+                    "parameters": [
+                        {"name": "url", "in": "query", "required": True, "schema": {"type": "string"}}
+                    ],
+                    "responses": {
+                        "200": {"description": "Media streamed"},
+                        "400": {"description": "Invalid url"},
+                    },
+                }
+            },
+            "/api/template-preview": {
+                "get": {
+                    "summary": "Get template preview slides",
+                    "responses": {"200": {"description": "Template preview metadata"}},
+                }
+            },
+            "/api/report-preview/{filename}": {
+                "get": {
+                    "summary": "Get generated report preview slides",
+                    "parameters": [
+                        {"name": "filename", "in": "path", "required": True, "schema": {"type": "string"}}
+                    ],
+                    "responses": {"200": {"description": "Report preview metadata"}},
+                }
+            },
+            "/api/download/{filename}": {
+                "get": {
+                    "summary": "Download generated PPTX",
+                    "parameters": [
+                        {"name": "filename", "in": "path", "required": True, "schema": {"type": "string"}}
+                    ],
+                    "responses": {"200": {"description": "PPTX file download"}},
+                }
+            },
+        },
+    }
+    return jsonify(spec)
+
+
+@app.route('/api/docs', methods=['GET'])
+def swagger_docs():
+    """Serve a lightweight Swagger UI page without extra backend dependencies."""
+    server_url = request.host_url.rstrip('/')
+    return Response(
+        f"""<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Phyo Report Generator API Docs</title>
+    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
+    <style>
+      body {{
+        margin: 0;
+        background: #f6faf8;
+      }}
+      .topbar {{
+        display: none;
+      }}
+    </style>
+  </head>
+  <body>
+    <div id="swagger-ui"></div>
+    <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+    <script>
+      window.ui = SwaggerUIBundle({{
+        url: "{server_url}/api/openapi.json",
+        dom_id: "#swagger-ui",
+        deepLinking: true,
+        presets: [SwaggerUIBundle.presets.apis],
+      }});
+    </script>
+  </body>
+</html>""",
+        mimetype="text/html",
+    )
+
+
 @app.route('/api/prompt-presets', methods=['GET'])
 def get_prompt_presets():
     """Return the built-in OpenRouter prompt presets."""
@@ -2600,7 +2887,16 @@ def generate_report():
                 if isinstance(parsed_budget_values, list):
                     budget_inr_values = [str(value).strip() if value is not None else "" for value in parsed_budget_values[:3]]
             except Exception:
-                budget_inr_values = [value.strip() for value in raw_budget_values.splitlines()[:3]]
+                quoted_values = re.findall(r'"([^"]*)"', raw_budget_values)
+                if quoted_values:
+                    budget_inr_values = [value.strip() for value in quoted_values[:3]]
+                else:
+                    fallback_values = [
+                        value.strip().strip('"').strip("'")
+                        for value in re.split(r'[\n,]+', raw_budget_values)
+                        if value.strip().strip('"').strip("'")
+                    ]
+                    budget_inr_values = fallback_values[:3]
 
         # Validate: need at least one input
         if not prompt and not images and not instagram_post_urls and not instagram_profile_url and not instagram_username and not youtube_post_url and not youtube_urls:
