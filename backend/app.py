@@ -2133,10 +2133,10 @@ def populate_powerpoint(data, images):
             extras_local = [
                 ("Slide: ", f"{creator_index + 1} of {creator_total}"),
                 ("Platform: ", _display_value(creator_item.get('platform') or 'Instagram')),
-                ("CPC Goal: ", _display_value(creator_item.get('cpcGoal') or financial_data_local.get('cpcGoal') or '')),
-                ("CPV Goal: ", _display_value(creator_item.get('cpvGoal') or financial_data_local.get('cpvGoal') or '')),
-                ("CPC Calculation: ", _display_value(creator_item.get('cpcCalculation') or financial_data_local.get('cpcCalculation') or '')),
-                ("CPV Calculation: ", _display_value(creator_item.get('cpvCalculation') or financial_data_local.get('cpvCalculation') or '')),
+                # ("CPC Goal: ", _display_value(creator_item.get('cpcGoal') or financial_data_local.get('cpcGoal') or '')),
+                # ("CPV Goal: ", _display_value(creator_item.get('cpvGoal') or financial_data_local.get('cpvGoal') or '')),
+                # ("CPC Calculation: ", _display_value(creator_item.get('cpcCalculation') or financial_data_local.get('cpcCalculation') or '')),
+                # ("CPV Calculation: ", _display_value(creator_item.get('cpvCalculation') or financial_data_local.get('cpvCalculation') or '')),
             ]
             learnings_text_local = creator_item.get('learnings', data.get('performance', {}).get('keyLearnings', ''))
             metric_box = slide.shapes.add_textbox(260000, 1470000, 2480000, 1980000)
@@ -2482,10 +2482,10 @@ def populate_powerpoint(data, images):
                         ("CPC: ", _display_value(_first_present(financial.get('cpc'), overall.get('cpc')))),
                         ("CPV: ", _display_value(_first_present(financial.get('cpv'), overall.get('cpv')))),
                         ("CPE: ", _display_value(_first_present(financial.get('cpe'), overall.get('cpe')))),
-                        ("CPC Goal: ", _display_value(financial.get('cpcGoal') or '')),
-                        ("CPV Goal: ", _display_value(financial.get('cpvGoal') or '')),
-                        ("CPC Calculation: ", _display_value(financial.get('cpcCalculation') or '')),
-                        ("CPV Calculation: ", _display_value(financial.get('cpvCalculation') or '')),
+                        # ("CPC Goal: ", _display_value(financial.get('cpcGoal') or '')),
+                        # ("CPV Goal: ", _display_value(financial.get('cpvGoal') or '')),
+                        # ("CPC Calculation: ", _display_value(financial.get('cpcCalculation') or '')),
+                        # ("CPV Calculation: ", _display_value(financial.get('cpvCalculation') or '')),
                     ]
                     learnings_text = (
                         overall.get('learnings')
