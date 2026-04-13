@@ -18,7 +18,7 @@ import json
 import mimetypes
 import re
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 import copy
 import time
 import subprocess
@@ -576,12 +576,12 @@ def build_remote_media_uploads(instagram_post=None):
             uploads.append(
                 InMemoryUpload(
                     response.content,
-                    filename=f"rapidapi_media_{index + 1}.jpg",
+                    filename=f"instagram_media_{index + 1}.jpg",
                     content_type=content_type,
                 )
             )
         except Exception as e:
-            print(f"[WARNING] Could not download RapidAPI media for OCR fallback: {e}")
+            print(f"[WARNING] Could not download Instagram media for OCR fallback: {e}")
 
     return uploads
 
@@ -1902,7 +1902,11 @@ def populate_powerpoint(data, images):
 
             total_lines = len(visible_metrics) + len(visible_extras) + (1 if learnings_summary else 0)
             body_size = 16
-            if total_lines >= 10:
+            if total_lines >= 14:
+                body_size = 11
+            elif total_lines >= 12:
+                body_size = 12
+            elif total_lines >= 10:
                 body_size = 13
             elif total_lines >= 8:
                 body_size = 14
@@ -1929,7 +1933,10 @@ def populate_powerpoint(data, images):
                 paragraph = text_frame.paragraphs[0] if index == 0 else text_frame.add_paragraph()
                 _add_label_value(paragraph, label, value)
 
-            remaining_slots = max(0, 10 - len(visible_metrics) - (1 if learnings_summary else 0))
+            line_capacity = 10
+            if total_lines > line_capacity:
+                line_capacity = min(total_lines, 15)
+            remaining_slots = max(0, line_capacity - len(visible_metrics) - (1 if learnings_summary else 0))
             for label, value in visible_extras[:remaining_slots]:
                 paragraph = text_frame.add_paragraph()
                 _add_label_value(paragraph, label, value)
@@ -1951,6 +1958,95 @@ def populate_powerpoint(data, images):
                 value_run.font.name = 'Aptos'
                 value_run.font.size = Pt(max(body_size - 1, 12))
                 value_run.font.color.rgb = RGBColor(0x2B, 0x3E, 0x5C)
+
+        def _insert_new_slide_at(presentation, layout, insert_index):
+            new_slide = presentation.slides.add_slide(layout)
+            slide_id_list = presentation.slides._sldIdLst
+            new_slide_id = slide_id_list[-1]
+            slide_id_list.remove(new_slide_id)
+            slide_id_list.insert(insert_index, new_slide_id)
+            return new_slide
+
+        def _render_campaign_gallery_slide(slide, image_items, page_index, total_pages):
+            title_box = slide.shapes.add_textbox(260000, 140000, 8600000, 520000)
+            title_tf = title_box.text_frame
+            _prepare_text_frame(title_tf)
+            title_para = title_tf.paragraphs[0]
+            _style_paragraph(title_para, alignment=PP_ALIGN.LEFT, line_spacing=1.0, space_after=Pt(0))
+            title_run = title_para.add_run()
+            title_run.text = f"Campaign Media Gallery ({page_index}/{total_pages})"
+            title_run.font.name = 'Aptos'
+            title_run.font.bold = True
+            title_run.font.size = Pt(24)
+            title_run.font.color.rgb = RGBColor(0x2B, 0x3E, 0x5C)
+
+            grid_boxes = [
+                {'left': 260000,  'top': 760000,  'width': 2750000, 'height': 1650000},
+                {'left': 3190000, 'top': 760000,  'width': 2750000, 'height': 1650000},
+                {'left': 6120000, 'top': 760000,  'width': 2750000, 'height': 1650000},
+                {'left': 260000,  'top': 2520000, 'width': 2750000, 'height': 1650000},
+                {'left': 3190000, 'top': 2520000, 'width': 2750000, 'height': 1650000},
+                {'left': 6120000, 'top': 2520000, 'width': 2750000, 'height': 1650000},
+            ]
+
+            for idx, image_item in enumerate(image_items[:6]):
+                if idx >= len(grid_boxes):
+                    break
+                stream_obj = image_item.get("stream")
+                if not stream_obj:
+                    continue
+                box = grid_boxes[idx]
+                _add_picture_with_fallback(
+                    slide,
+                    stream_obj,
+                    default_box={**box, 'rotation': 0},
+                )
+
+                caption_text = image_item.get("label") or f"Image {idx + 1}"
+                caption_box = slide.shapes.add_textbox(
+                    box['left'],
+                    box['top'] + box['height'] + 60000,
+                    box['width'],
+                    280000,
+                )
+                caption_tf = caption_box.text_frame
+                _prepare_text_frame(caption_tf)
+                caption_para = caption_tf.paragraphs[0]
+                _style_paragraph(caption_para, alignment=PP_ALIGN.LEFT, line_spacing=1.0, space_after=Pt(0))
+                caption_run = caption_para.add_run()
+                caption_run.text = _clip_text(caption_text, 62)
+                caption_run.font.name = 'Aptos'
+                caption_run.font.bold = False
+                caption_run.font.size = Pt(10)
+                caption_run.font.color.rgb = RGBColor(0x2B, 0x3E, 0x5C)
+
+        def _dedupe_creators_for_slides(creators):
+            deduped = []
+            key_index = {}
+
+            for item in creators:
+                if not isinstance(item, dict):
+                    continue
+
+                normalized = dict(item)
+                name_value = (normalized.get("name") or normalized.get("creator_name") or "").strip()
+                post_url_value = (normalized.get("postUrl") or "").strip().lower()
+                name_key = re.sub(r"[^a-z0-9]+", "", name_value.lower())
+                dedupe_key = post_url_value or name_key or f"creator_{len(deduped)}"
+
+                if dedupe_key in key_index:
+                    existing_item = deduped[key_index[dedupe_key]]
+                    for merge_key, merge_value in normalized.items():
+                        if merge_value in (None, "", "N/A"):
+                            continue
+                        if existing_item.get(merge_key) in (None, "", "N/A"):
+                            existing_item[merge_key] = merge_value
+                    continue
+
+                key_index[dedupe_key] = len(deduped)
+                deduped.append(normalized)
+
+            return deduped
 
         def _clone_slide_from_template(presentation, source_slide, insert_index=None):
             new_slide = presentation.slides.add_slide(source_slide.slide_layout)
@@ -2166,9 +2262,63 @@ def populate_powerpoint(data, images):
                             break
 
             return selected, selected_indices
+
+        def _find_logo_placeholder(slide):
+            fallback_logo_placeholder = None
+            for shape in slide.shapes:
+                if not hasattr(shape, 'text'):
+                    continue
+                shape_text = (shape.text or "").strip().upper()
+                if not shape_text:
+                    continue
+                if "BRAND LOGO HERE" in shape_text:
+                    return shape
+                if "LOGO" in shape_text and fallback_logo_placeholder is None:
+                    fallback_logo_placeholder = shape
+            return fallback_logo_placeholder
+
+        def _resolve_brand_logo_bytes(logo_images):
+            if logo_images:
+                img_bytes = logo_images[0].read()
+                logo_images[0].seek(0)
+                if img_bytes:
+                    return img_bytes, "uploaded_image"
+
+            brand_logo_url = (data.get('brandLogo') or '').strip()
+            if brand_logo_url:
+                brand_logo_stream = _download_image_stream(brand_logo_url)
+                if brand_logo_stream:
+                    return brand_logo_stream.getvalue(), "brand_logo_url"
+            return b"", ""
+
+        def _place_brand_logo(slide, logo_bytes, slide_label, fallback_box):
+            if not logo_bytes:
+                return False
+
+            logo_placeholder = _find_logo_placeholder(slide)
+            box = dict(fallback_box)
+            if logo_placeholder:
+                box = {
+                    'left': logo_placeholder.left,
+                    'top': logo_placeholder.top,
+                    'width': logo_placeholder.width,
+                    'height': logo_placeholder.height,
+                    'rotation': 0,
+                }
+                _remove_shape(logo_placeholder)
+
+            with io.BytesIO(logo_bytes) as logo_stream:
+                _add_picture_with_fallback(
+                    slide,
+                    logo_stream,
+                    default_box=box,
+                )
+            print(f"[OK] Brand logo inserted on {slide_label}")
+            return True
         
         # SLIDE 1: Insert Brand Logo
         hero_image_stream = None
+        brand_logo_bytes = b""
         if len(prs.slides) > 0:
             slide_1 = prs.slides[0]
             
@@ -2179,72 +2329,23 @@ def populate_powerpoint(data, images):
                       for c in data.get('image_classifications', []))
             ]
             
-            logo_placeholder = None
-            for shape in slide_1.shapes:
-                if hasattr(shape, 'text') and 'BRAND LOGO HERE' in shape.text.upper():
-                    logo_placeholder = shape
-                    break
-
-            if logo_images:
-                print("[DESIGN] Adding brand logo to Slide 1")
-                if logo_placeholder:
-                    # Get position and size from placeholder
-                    left = logo_placeholder.left
-                    top = logo_placeholder.top
-                    width = logo_placeholder.width
-                    height = logo_placeholder.height
-                    
-                    # Delete the placeholder text box
-                    sp = logo_placeholder.element
-                    sp.getparent().remove(sp)
-                    
-                    # Insert brand logo image at the same position
-                    img_bytes = logo_images[0].read()
-                    logo_images[0].seek(0)
-                    
-                    with io.BytesIO(img_bytes) as img_stream:
-                        _add_picture_with_fallback(
-                            slide_1,
-                            img_stream,
-                            default_box={
-                                'left': left,
-                                'top': top,
-                                'width': width,
-                                'height': height,
-                                'rotation': 0,
-                            }
-                        )
-                    
-                    print("[OK] Brand logo inserted successfully on Slide 1")
-                else:
-                    print("[WARNING]  'BRAND LOGO HERE' placeholder not found on Slide 1")
-            elif logo_placeholder:
-                left = logo_placeholder.left
-                top = logo_placeholder.top
-                width = logo_placeholder.width
-                height = logo_placeholder.height
-                _remove_shape(logo_placeholder)
-                brand_logo_stream = _download_image_stream(data.get('brandLogo') or '')
-                if brand_logo_stream:
-                    _add_picture_with_fallback(
-                        slide_1,
-                        brand_logo_stream,
-                        default_box={
-                            'left': left,
-                            'top': top,
-                            'width': width,
-                            'height': height,
-                            'rotation': 0,
-                        }
-                    )
+            brand_logo_bytes, logo_source = _resolve_brand_logo_bytes(logo_images)
+            if brand_logo_bytes:
+                print(f"[DESIGN] Adding brand logo from {logo_source}")
+                _place_brand_logo(
+                    slide_1,
+                    brand_logo_bytes,
+                    "Slide 1",
+                    fallback_box={
+                        'left': 4675100,
+                        'top': 2084875,
+                        'width': 2552100,
+                        'height': 461700,
+                        'rotation': 0,
+                    }
+                )
             else:
-                if logo_placeholder:
-                    left = logo_placeholder.left
-                    top = logo_placeholder.top
-                    width = logo_placeholder.width
-                    height = logo_placeholder.height
-                    _remove_shape(logo_placeholder)
-                print("[WARNING]  No brand logo image classified in uploaded images")
+                print("[WARNING] No brand logo source found for Slide 1")
 
             slide_1_image_streams, _ = _select_uploaded_streams(
                 preferred_types=['campaign_photo', 'creator_content'],
@@ -2269,16 +2370,16 @@ def populate_powerpoint(data, images):
             if slide_1_image_streams:
                 hero_image_stream = slide_1_image_streams[0]
                 for shape in list(slide_1.shapes):
-                    if shape.shape_type == 1 and getattr(shape, 'top', 0) > 2400000:
+                    if shape.shape_type == 1 and getattr(shape, 'top', 0) > 3200000:
                         _remove_shape(shape)
                 _add_picture_with_fallback(
                     slide_1,
                     hero_image_stream,
                     default_box={
-                        'left': 1650000,
-                        'top': 2500000,
-                        'width': 5400000,
-                        'height': 2350000,
+                        'left': 1700000,
+                        'top': 3200000,
+                        'width': 5250000,
+                        'height': 1180000,
                         'rotation': 0,
                     }
                 )
@@ -2287,6 +2388,19 @@ def populate_powerpoint(data, images):
         # SLIDE 2: Add dynamic campaign image similar to the opening hero treatment
         if len(prs.slides) > 1 and hero_image_stream:
             slide_2 = prs.slides[1]
+            if brand_logo_bytes:
+                _place_brand_logo(
+                    slide_2,
+                    brand_logo_bytes,
+                    "Slide 2",
+                    fallback_box={
+                        'left': 6620000,
+                        'top': 220000,
+                        'width': 2200000,
+                        'height': 520000,
+                        'rotation': 0,
+                    }
+                )
             for shape in list(slide_2.shapes):
                 if shape.shape_type == 1 and getattr(shape, 'left', 0) < 3600000 and getattr(shape, 'top', 0) > 900000:
                     _remove_shape(shape)
@@ -2315,6 +2429,8 @@ def populate_powerpoint(data, images):
 
                         print(f"[OK] Updated Slide 3 with styled campaign name: {campaign_name}")
         
+        campaign_gallery_items = []
+
         # SLIDE 4: Overall Campaign Report with bold data
         if len(prs.slides) > 3:
             slide_4 = prs.slides[3]
@@ -2323,6 +2439,20 @@ def populate_powerpoint(data, images):
             instagram = data.get('instagram', {})
             financial = data.get('financial', {})
             performance = data.get('performance', {})
+            creator_items = [item for item in data.get("creators", []) if isinstance(item, dict)]
+            unique_creator_names = []
+            seen_creator_names = set()
+            for creator_item in creator_items:
+                creator_name_candidate = (creator_item.get("name") or "").strip()
+                if not creator_name_candidate:
+                    continue
+                creator_name_key = creator_name_candidate.lower()
+                if creator_name_key in seen_creator_names:
+                    continue
+                seen_creator_names.add(creator_name_key)
+                unique_creator_names.append(creator_name_candidate)
+
+            creators_display = ", ".join(unique_creator_names[:4]) if unique_creator_names else _display_value(data.get('creator') or '')
             budget_display = financial.get('totalBudget') or overall.get('budget') or ''
             if budget_display and financial.get('budgetCurrency'):
                 budget_display = f"{budget_display} {financial.get('budgetCurrency')}"
@@ -2342,15 +2472,16 @@ def populate_powerpoint(data, images):
                         ("Engagement Rate: ", _display_value(_first_present(instagram.get('engagementRate'), overall.get('engagementRate')))),
                         ("Total Engagement: ", _display_value(_prefer_interactions(performance.get('totalEngagement'), performance.get('totalInteractions')) or overall.get('total_engagement') or '')),
                         ("Budget: ", _display_value(budget_display)),
-                        ("CPC: ", _display_value(_first_present(financial.get('cpc'), overall.get('cpc')))),
-                        ("CPV: ", _display_value(_first_present(financial.get('cpv'), overall.get('cpv')))),
-                        ("CPE: ", _display_value(_first_present(financial.get('cpe'), overall.get('cpe'))))
                     ]
 
                     extras = [
                         ("Campaign: ", _display_value(data.get('campaignName') or data.get('campaign_name') or '')),
                         ("Brand: ", _display_value(data.get('brand') or data.get('brand_name') or '')),
-                        ("Creators: ", _display_value(data.get('creator') or '')),
+                        ("Creators: ", _display_value(creators_display)),
+                        ("Creator Count: ", _display_value(str(len(unique_creator_names)) if unique_creator_names else '')),
+                        ("CPC: ", _display_value(_first_present(financial.get('cpc'), overall.get('cpc')))),
+                        ("CPV: ", _display_value(_first_present(financial.get('cpv'), overall.get('cpv')))),
+                        ("CPE: ", _display_value(_first_present(financial.get('cpe'), overall.get('cpe')))),
                         ("CPC Goal: ", _display_value(financial.get('cpcGoal') or '')),
                         ("CPV Goal: ", _display_value(financial.get('cpvGoal') or '')),
                         ("CPC Calculation: ", _display_value(financial.get('cpcCalculation') or '')),
@@ -2367,11 +2498,16 @@ def populate_powerpoint(data, images):
                     break
             
             # Add campaign photos (up to 3) - Replace template placeholders with rotation
-            campaign_image_streams, _ = _select_uploaded_streams(
+            campaign_image_streams, campaign_image_indices = _select_uploaded_streams(
                 preferred_types=['campaign_photo'],
-                limit=3,
+                limit=10,
                 fallback_any=False,
             )
+            campaign_image_items = []
+            for idx, stream in enumerate(campaign_image_streams):
+                upload_idx = campaign_image_indices[idx] if idx < len(campaign_image_indices) else None
+                label = f"Uploaded image {idx + 1}" if upload_idx is None else f"Uploaded image #{upload_idx + 1}"
+                campaign_image_items.append({"stream": stream, "label": label})
             if not campaign_image_streams:
                 url_image_candidates = []
                 seen_url_images = set()
@@ -2383,18 +2519,22 @@ def populate_powerpoint(data, images):
                     if image_url and image_url not in seen_url_images:
                         seen_url_images.add(image_url)
                         url_image_candidates.append(image_url)
-                    if len(url_image_candidates) >= 3:
+                    if len(url_image_candidates) >= 10:
                         break
 
                 top_level_post_image = (data.get("postImage") or "").strip()
-                if top_level_post_image and top_level_post_image not in seen_url_images and len(url_image_candidates) < 3:
+                if top_level_post_image and top_level_post_image not in seen_url_images and len(url_image_candidates) < 10:
                     seen_url_images.add(top_level_post_image)
                     url_image_candidates.append(top_level_post_image)
 
-                for image_url in url_image_candidates[:3]:
+                for image_url in url_image_candidates[:10]:
                     fallback_campaign_image = _download_image_stream(image_url)
                     if fallback_campaign_image:
                         campaign_image_streams.append(fallback_campaign_image)
+                        campaign_image_items.append({"stream": fallback_campaign_image, "label": image_url})
+            elif not campaign_image_items:
+                for idx, stream in enumerate(campaign_image_streams):
+                    campaign_image_items.append({"stream": stream, "label": f"Campaign image {idx + 1}"})
             
             if campaign_image_streams:
                 print(f"[IMAGE] Adding {len(campaign_image_streams[:3])} campaign photos to Slide 4")
@@ -2439,17 +2579,39 @@ def populate_powerpoint(data, images):
                 for idx, (img_stream, box) in enumerate(zip(campaign_image_streams[:3], active_layout)):
                     _add_picture_with_fallback(slide_4, img_stream, default_box=box, rotation=box.get('rotation', 0))
                     print(f"[OK] Added campaign photo {idx + 1} using fixed layout box")
+
+                if len(campaign_image_items) > 3 and len(prs.slides) > 4:
+                    campaign_gallery_items = campaign_image_items[3:10]
+                    print(f"[IMAGE] Queued {len(campaign_gallery_items)} additional campaign image(s) for gallery slides")
         
         # SLIDE 5: Creator x Brand with bold data
         if len(prs.slides) > 4:
             slide_5_template = prs.slides[4]
+
+            if campaign_gallery_items:
+                chunks = [
+                    campaign_gallery_items[idx:idx + 6]
+                    for idx in range(0, len(campaign_gallery_items), 6)
+                ]
+                insert_index = 4
+                gallery_layout = prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[0]
+                for page_idx, chunk in enumerate(chunks, start=1):
+                    gallery_slide = _insert_new_slide_at(prs, gallery_layout, insert_index)
+                    _render_campaign_gallery_slide(gallery_slide, chunk, page_idx, len(chunks))
+                    print(f"[OK] Rendered campaign gallery slide {page_idx}/{len(chunks)} with {len(chunk)} image(s)")
+                    insert_index += 1
+
+                # Template moved after gallery insertion; refresh handle at current index.
+                slide_5_template = prs.slides[insert_index]
+
             creators = [item for item in data.get('creators', []) if isinstance(item, dict)]
             if not creators:
                 fallback_creator = data.get('creator_data', {}) or {}
                 fallback_creator["name"] = fallback_creator.get('creator_name', data.get('creator', 'Creator'))
                 creators = [fallback_creator]
+            creators = _dedupe_creators_for_slides(creators)
 
-            creator_slides = creators[:3]
+            creator_slides = creators[:10]
             creator_image_streams, _ = _select_uploaded_streams(
                 preferred_types=['creator_content'],
                 limit=max(1, len(creator_slides)),
@@ -2462,7 +2624,13 @@ def populate_powerpoint(data, images):
             )
 
             creator_detail_slides = [slide_5_template]
-            insert_index = 5
+            template_slide_id = slide_5_template.slide_id
+            template_index = 0
+            for idx, slide_obj in enumerate(prs.slides):
+                if slide_obj.slide_id == template_slide_id:
+                    template_index = idx
+                    break
+            insert_index = template_index + 1
             for _ in creator_slides[1:]:
                 creator_detail_slides.append(
                     _clone_slide_from_template(prs, slide_5_template, insert_index=insert_index)
@@ -2516,7 +2684,7 @@ def upload_to_google_drive(file_path, filename):
         
         # Try to load from token.pickle file
         if os.path.exists('token.pickle'):
-            print("📂 Loading credentials from token.pickle...")
+            print("[INFO] Loading credentials from token.pickle...")
             with open('token.pickle', 'rb') as token:
                 creds = pickle.load(token)
         else:
@@ -2526,7 +2694,7 @@ def upload_to_google_drive(file_path, filename):
         
         # Refresh token if expired (NO BROWSER NEEDED)
         if creds and creds.expired and creds.refresh_token:
-            print("🔄 Refreshing expired token...")
+            print("[INFO] Refreshing expired token...")
             creds.refresh(Request())
             
             # Save refreshed token
@@ -2555,7 +2723,7 @@ def upload_to_google_drive(file_path, filename):
             resumable=True
         )
         
-        print(f"📤 Uploading to Google Drive...")
+        print("[INFO] Uploading to Google Drive...")
         file = service.files().create(
             body=file_metadata,
             media_body=media,
@@ -2618,14 +2786,24 @@ def health_check():
             "using_openrouter": USE_OPENROUTER,
         },
         "env": {
-            "rapidapi_key_present": bool(os.environ.get("RAPIDAPI_KEY", "").strip()),
-            "rapidapi_host_present": bool(os.environ.get("RAPIDAPI_HOST", "").strip()),
-            "rapidapi_instagram_media_url_present": bool(os.environ.get("RAPIDAPI_INSTAGRAM_MEDIA_URL", "").strip()),
             "openrouter_api_key_present": bool(os.environ.get("OPENROUTER_API_KEY", "").strip()),
             "anthropic_api_key_present": bool(os.environ.get("ANTHROPIC_API_KEY", "").strip()),
             "brightdata_api_token_present": bool(
                 os.environ.get("BRIGHTDATA_API_TOKEN", "").strip()
                 or os.environ.get("BRIGHTDATA_API_KEY", "").strip()
+            ),
+            "brightdata_instagram_post_dataset_id_present": bool(
+                os.environ.get("BRIGHTDATA_INSTAGRAM_POST_DATASET_ID", "").strip()
+            ),
+            "brightdata_instagram_reels_dataset_id_present": bool(
+                os.environ.get("BRIGHTDATA_INSTAGRAM_REELS_DATASET_ID", "").strip()
+            ),
+            "brightdata_instagram_posts_dataset_id_present": bool(
+                os.environ.get("BRIGHTDATA_INSTAGRAM_POSTS_DATASET_ID", "").strip()
+            ),
+            "brightdata_instagram_profile_dataset_id_present": bool(
+                os.environ.get("BRIGHTDATA_INSTAGRAM_PROFILE_DATASET_ID", "").strip()
+                or os.environ.get("BRIGHTDATA_INSTAGRAM_DATASET_ID", "").strip()
             ),
         },
     })
@@ -2694,11 +2872,11 @@ def openapi_spec():
                                     "type": "object",
                                     "properties": {
                                         "prompt": {"type": "string"},
-                                        "instagram_post_url": {"type": "string", "description": "One or more URLs separated by new lines"},
+                                        "instagram_post_url": {"type": "string", "description": "One or more URLs separated by new lines (up to 10 processed)"},
                                         "budget_inr_values": {
                                             "type": "string",
-                                            "description": "JSON string array like [\"10000\",\"20000\",\"\"]",
-                                            "example": "[\"10000\",\"20000\",\"\"]"
+                                            "description": "JSON string array for URL-wise budgets (up to 10 entries)",
+                                            "example": "[\"10000\",\"20000\",\"\",\"\",\"\"]"
                                         },
                                         "images": {
                                             "type": "array",
@@ -2870,33 +3048,35 @@ def generate_report():
         instagram_profile_url = request.form.get('instagram_profile_url', '').strip()
         instagram_username = request.form.get('instagram_username', '').strip()
         youtube_post_url   = request.form.get('youtube_post_url',  '').strip()
-        content_urls = _extract_urls_from_text(instagram_post_url)
-        max_content_urls = 3
+        content_urls = _extract_urls_from_text(instagram_post_url, dedupe=False)
+        max_content_urls = 10
         all_instagram_post_urls = [
             url for url in content_urls
             if "instagram.com" in url.lower() and any(token in url.lower() for token in ["/reel/", "/p/", "/tv/"])
         ]
         all_youtube_urls = [url for url in content_urls if "youtube.com" in url.lower() or "youtu.be" in url.lower()]
-        instagram_post_urls = all_instagram_post_urls[:max_content_urls]
-        youtube_urls = all_youtube_urls[:max_content_urls]
+        instagram_post_urls_raw = all_instagram_post_urls[:max_content_urls]
+        youtube_urls_raw = all_youtube_urls[:max_content_urls]
+        instagram_post_urls = list(dict.fromkeys(instagram_post_urls_raw))
+        youtube_urls = list(dict.fromkeys(youtube_urls_raw))
 
         budget_inr_values = []
         if raw_budget_values:
             try:
                 parsed_budget_values = json.loads(raw_budget_values)
                 if isinstance(parsed_budget_values, list):
-                    budget_inr_values = [str(value).strip() if value is not None else "" for value in parsed_budget_values[:3]]
+                    budget_inr_values = [str(value).strip() if value is not None else "" for value in parsed_budget_values[:max_content_urls]]
             except Exception:
                 quoted_values = re.findall(r'"([^"]*)"', raw_budget_values)
                 if quoted_values:
-                    budget_inr_values = [value.strip() for value in quoted_values[:3]]
+                    budget_inr_values = [value.strip() for value in quoted_values[:max_content_urls]]
                 else:
                     fallback_values = [
                         value.strip().strip('"').strip("'")
                         for value in re.split(r'[\n,]+', raw_budget_values)
                         if value.strip().strip('"').strip("'")
                     ]
-                    budget_inr_values = fallback_values[:3]
+                    budget_inr_values = fallback_values[:max_content_urls]
 
         # Validate: need at least one input
         if not prompt and not images and not instagram_post_urls and not instagram_profile_url and not instagram_username and not youtube_post_url and not youtube_urls:
@@ -2941,8 +3121,9 @@ def generate_report():
         youtube_metrics = {}
         ocr_metrics = {}
         extracted_data = create_default_data()
-        if instagram_post_urls:
-            extracted_data["requestedInstagramPostUrls"] = list(instagram_post_urls)
+        if instagram_post_urls_raw:
+            extracted_data["requestedInstagramPostUrls"] = list(instagram_post_urls_raw)
+            extracted_data["processedInstagramPostUrls"] = list(instagram_post_urls)
         if youtube_urls:
             extracted_data["requestedYoutubeUrls"] = list(youtube_urls)
         if len(all_instagram_post_urls) > max_content_urls:
@@ -2965,13 +3146,11 @@ def generate_report():
         )
 
         future_map = {}
-        instagram_post_futures = {}
-        max_workers = 1 + len(instagram_post_urls) + int(bool(profile_username)) + int(bool(HAS_YT_DLP and yt_url)) + int(bool(images)) + int(bool(images))
+        max_workers = 1 + int(bool(instagram_post_urls)) + int(bool(profile_username)) + int(bool(HAS_YT_DLP and yt_url)) + int(bool(images)) + int(bool(images))
         with ThreadPoolExecutor(max_workers=max(1, min(6, max_workers))) as executor:
-            for idx, url in enumerate(instagram_post_urls):
-                print(f"[INSTAGRAM POST {idx + 1}/{len(instagram_post_urls)}] Queueing exact metrics fetch from: {url}")
-                future = executor.submit(fetch_instagram_post_data, url)
-                instagram_post_futures[future] = url
+            if instagram_post_urls:
+                print(f"[INSTAGRAM POSTS] Queueing Bright Data batch fetch for {len(instagram_post_urls)} URL(s)")
+                future_map["instagram_posts"] = executor.submit(fetch_instagram_posts_batch, instagram_post_urls)
 
             if profile_username:
                 print(f"[INSTAGRAM PROFILE] Fetching profile data for: {profile_ref}")
@@ -2986,26 +3165,40 @@ def generate_report():
                 future_map["vision_extract"] = executor.submit(analyze_images_with_gpt4, clone_uploads(images), prompt)
 
             instagram_post_results = []
-            for future in as_completed(instagram_post_futures):
-                url = instagram_post_futures[future]
-                try:
-                    post_data = future.result()
-                except Exception as e:
-                    post_data = None
-                    print(f"[WARNING] Instagram metrics fetch failed for {url}: {e}")
+            if "instagram_posts" in future_map:
+                instagram_batch = future_map["instagram_posts"].result() or {}
+                instagram_post_results = instagram_batch.get("results", []) or []
+                invalid_urls = instagram_batch.get("invalid_urls", []) or []
+                for invalid_url in invalid_urls:
+                    warnings.append(
+                        f"Skipped invalid Instagram post URL: {invalid_url}"
+                    )
 
-                if post_data:
-                    instagram_post_results.append(post_data)
+                fetched_url_keys = set()
+                for post_data in instagram_post_results:
+                    status_payload = post_data.get("urlStatus", {}) or {}
+                    status_url = (status_payload.get("url") or "").strip()
+                    if status_url:
+                        fetched_url_keys.add(status_url.lower())
+
                     if post_data.get("hasMetrics"):
                         print(
-                            f"[OK] Post metrics fetched for {url} - likes: {post_data['instagram'].get('likes')}, "
+                            f"[OK] Post metrics fetched for {status_url or 'Instagram URL'} - "
+                            f"likes: {post_data['instagram'].get('likes')}, "
                             f"views: {post_data['instagram'].get('views')}"
                         )
                     else:
-                        print(f"[OK] Partial Instagram metadata fetched for {url}")
-                else:
+                        print(f"[OK] Partial Instagram metadata fetched for {status_url or 'Instagram URL'}")
+
+                for url in instagram_post_urls:
+                    if (url or "").strip().lower() not in fetched_url_keys:
+                        warnings.append(
+                            f"Bright Data did not return usable Instagram metrics for {url}, so the backend skipped that URL and continued with the remaining sources."
+                        )
+                if instagram_post_urls and not instagram_post_results:
                     warnings.append(
-                        f"RapidAPI did not return usable Instagram metrics for {url}, so the backend skipped that URL and continued with the remaining sources."
+                        "Bright Data returned no matched post/reel rows. "
+                        "Set correct dataset IDs: BRIGHTDATA_INSTAGRAM_REELS_DATASET_ID for /reel/ URLs and BRIGHTDATA_INSTAGRAM_POSTS_DATASET_ID for /p/ URLs."
                     )
 
             if len(instagram_post_results) > 1:
@@ -3033,6 +3226,12 @@ def generate_report():
             if "vision_extract" in future_map:
                 extracted_data = future_map["vision_extract"].result() or create_default_data()
 
+        if instagram_post_urls_raw:
+            extracted_data["requestedInstagramPostUrls"] = list(instagram_post_urls_raw)
+            extracted_data["processedInstagramPostUrls"] = list(instagram_post_urls)
+        if youtube_urls:
+            extracted_data["requestedYoutubeUrls"] = list(youtube_urls)
+
         if images and not has_meaningful_metrics(extracted_data) and not ocr_metrics:
             warnings.append(
                 "The uploaded images did not expose readable metrics, so the backend ignored them for metrics and used only prompt text and other available sources."
@@ -3041,7 +3240,7 @@ def generate_report():
         if not images and instagram_post:
             remote_media_uploads = build_remote_media_uploads(instagram_post)
             if remote_media_uploads:
-                print(f"[IMAGE] Using {len(remote_media_uploads)} RapidAPI media image(s) as fallback extraction input")
+                print(f"[IMAGE] Using {len(remote_media_uploads)} Bright Data media image(s) as fallback extraction input")
                 remote_ocr_metrics = extract_metrics_from_images_ocr(clone_uploads(remote_media_uploads))
                 if remote_ocr_metrics:
                     for key, value in remote_ocr_metrics.items():
@@ -3122,7 +3321,7 @@ def generate_report():
 
         # Step 5: Merge all metrics from prompt, images, and URLs.
         # Priority (highest → lowest):
-        #   1. RapidAPI / direct URL metrics with non-zero values
+        #   1. Bright Data / direct URL metrics with non-zero values
         #   2. Vision / OCR image metrics
         #   3. Prompt text metrics
         #   4. YouTube API fills YouTube fields
@@ -3235,13 +3434,28 @@ def generate_report():
                 extracted_data["instagramCombinedSummary"] = instagram_post.get("summary")
             extracted_data["instagramSource"] = instagram_post.get("source", "instagram_url")
             if cleaned_budget_values:
+                budget_per_url_map = {}
+                for idx, url in enumerate(instagram_post_urls_raw):
+                    normalized_url = (url or "").strip().lower()
+                    if not normalized_url:
+                        continue
+                    budget_value_raw = cleaned_budget_values[idx] if idx < len(cleaned_budget_values) else ""
+                    try:
+                        budget_value = float(str(budget_value_raw).replace(",", "").strip()) if budget_value_raw else 0.0
+                    except Exception:
+                        budget_value = 0.0
+                    if budget_value <= 0:
+                        continue
+                    budget_per_url_map.setdefault(normalized_url, {"url": url, "total": 0.0})
+                    budget_per_url_map[normalized_url]["total"] += budget_value
+
                 extracted_data["budgetPerUrl"] = [
                     {
-                        "url": url,
-                        "budget": cleaned_budget_values[idx] if idx < len(cleaned_budget_values) else "",
+                        "url": payload["url"],
+                        "budget": str(int(payload["total"])) if float(payload["total"]).is_integer() else f"{payload['total']:.2f}",
                         "currency": "INR",
                     }
-                    for idx, url in enumerate(instagram_post_urls)
+                    for payload in budget_per_url_map.values()
                 ]
             if (not extracted_data.get("campaignName") or extracted_data.get("campaignName") == "Campaign Report"):
                 campaign_candidate = (
@@ -3376,24 +3590,22 @@ def generate_report():
             creators = [{"name": creator_name}]
             extracted_data["creators"] = creators
         deduped_creators = []
-        seen_creator_keys = set()
+        creator_index_by_key = {}
         budget_by_url = {}
-        for idx, url in enumerate(instagram_post_urls):
+        for idx, url in enumerate(instagram_post_urls_raw):
             normalized_url = (url or "").strip().lower()
             if not normalized_url:
                 continue
-            if idx < len(cleaned_budget_values) and cleaned_budget_values[idx]:
-                budget_by_url[normalized_url] = cleaned_budget_values[idx]
+            budget_raw = cleaned_budget_values[idx] if idx < len(cleaned_budget_values) else ""
+            budget_value = _safe_float(budget_raw)
+            if budget_value > 0:
+                budget_by_url[normalized_url] = budget_by_url.get(normalized_url, 0.0) + budget_value
 
         for c in creators:
             if not isinstance(c, dict):
                 continue
-            name = (c.get("name") or creator_name or "Creator").strip()
-            creator_key = f"{name.lower()}|{(c.get('postUrl') or '').strip().lower()}"
-            if creator_key in seen_creator_keys:
-                continue
-            seen_creator_keys.add(creator_key)
             normalized_creator = dict(c)
+            name = (normalized_creator.get("name") or creator_name or "Creator").strip()
             normalized_creator["name"] = name
             for ig_key in ["views", "likes", "comments", "shares", "saves", "reach", "engagementRate"]:
                 existing_val = normalized_creator.get(ig_key, "")
@@ -3404,7 +3616,7 @@ def generate_report():
             creator_post_url = (normalized_creator.get("postUrl") or "").strip().lower()
             creator_budget_value = normalized_creator.get("budget", "")
             if not _has_metric_value(creator_budget_value) and creator_post_url in budget_by_url:
-                normalized_creator["budget"] = budget_by_url[creator_post_url]
+                normalized_creator["budget"] = _format_formula_metric(budget_by_url[creator_post_url])
 
             total = sum(_safe_int(normalized_creator.get(k)) for k in ["likes", "comments", "shares", "saves"])
             normalized_creator["interactions"] = str(total) if total > 0 else normalized_creator.get("interactions", "")
@@ -3420,14 +3632,43 @@ def generate_report():
                 normalized_creator["cpe"] = _format_formula_metric(creator_budget_numeric / creator_interactions_numeric)
             if creator_budget_numeric > 0 and creator_clicks_numeric > 0:
                 normalized_creator["cpc"] = _format_formula_metric(creator_budget_numeric / creator_clicks_numeric)
+
+            creator_name_key = re.sub(r"[^a-z0-9]+", "", name.lower())
+            creator_url_key = (normalized_creator.get("postUrl") or "").strip().lower()
+            dedupe_key = creator_url_key or creator_name_key or f"creator_{len(deduped_creators)}"
+
+            if dedupe_key in creator_index_by_key:
+                existing_creator = deduped_creators[creator_index_by_key[dedupe_key]]
+                for merge_key, merge_value in normalized_creator.items():
+                    if not _has_metric_value(merge_value):
+                        continue
+                    if not _has_metric_value(existing_creator.get(merge_key)):
+                        existing_creator[merge_key] = merge_value
+                continue
+
+            creator_index_by_key[dedupe_key] = len(deduped_creators)
             deduped_creators.append(normalized_creator)
         extracted_data["creators"] = deduped_creators
         if deduped_creators:
-            extracted_data["creator"] = " + ".join(
-                creator_item.get("name", "").strip()
-                for creator_item in deduped_creators
-                if creator_item.get("name", "").strip()
-            )[:120]
+            creator_names = []
+            seen_creator_name_keys = set()
+            for creator_item in deduped_creators:
+                creator_item_name = (creator_item.get("name", "") or "").strip()
+                if not creator_item_name:
+                    continue
+                creator_item_key = creator_item_name.lower()
+                if creator_item_key in seen_creator_name_keys:
+                    continue
+                seen_creator_name_keys.add(creator_item_key)
+                creator_names.append(creator_item_name)
+            extracted_data["creator"] = " + ".join(creator_names)[:120]
+
+        # Preserve request/debug URL fields in final payload even if earlier extractors replaced the object.
+        if instagram_post_urls_raw:
+            extracted_data["requestedInstagramPostUrls"] = list(instagram_post_urls_raw)
+            extracted_data["processedInstagramPostUrls"] = list(instagram_post_urls)
+        if youtube_urls:
+            extracted_data["requestedYoutubeUrls"] = list(youtube_urls)
 
         # Step 6: Populate PowerPoint template
         output_path = populate_powerpoint(extracted_data, images)
@@ -3455,7 +3696,7 @@ def generate_report():
         ig = extracted_data.get("instagram", {})
         has_ig_metrics = any(ig.get(k) for k in ["views", "likes", "comments", "reach"])
         if not has_ig_metrics:
-            warnings.append("No Instagram metrics found from RapidAPI. Provide a valid Instagram profile URL/username or post/reel URL.")
+            warnings.append("No Instagram metrics found from Bright Data. Provide a valid Instagram profile URL/username or post/reel URL.")
 
         return jsonify({
             "success": True,
@@ -3494,8 +3735,12 @@ def _dig(obj, *path):
     for key in path:
         if isinstance(cur, dict):
             cur = cur.get(key)
-        elif isinstance(cur, list) and isinstance(key, int) and 0 <= key < len(cur):
-            cur = cur[key]
+        elif isinstance(cur, list) and isinstance(key, int):
+            index = key if key >= 0 else len(cur) + key
+            if 0 <= index < len(cur):
+                cur = cur[index]
+            else:
+                return None
         else:
             return None
     return cur
@@ -3566,90 +3811,191 @@ def _extract_brightdata_records(payload):
     return []
 
 
-def _extract_rapidapi_media_records(payload):
-    if isinstance(payload, list):
-        records = []
-        for item in payload:
-            records.extend(_extract_rapidapi_media_records(item))
-        return records
-    if isinstance(payload, dict):
-        media_node = payload.get("xdt_shortcode_media")
-        if isinstance(media_node, dict):
-            return [media_node]
-        for key in ["data", "results", "items", "media", "post", "graphql", "response"]:
-            value = payload.get(key)
-            if isinstance(value, list):
-                records = _extract_rapidapi_media_records(value)
-                if records:
-                    return records
-            if isinstance(value, dict):
-                nested = _extract_rapidapi_media_records(value)
-                if nested:
-                    return nested
-        if payload.get("shortcode") or payload.get("video_url") or payload.get("display_url"):
-            return [payload]
-    return []
+def _parse_brightdata_response(resp):
+    """
+    Bright Data can return JSON or JSONL (application/jsonl).
+    Normalize both response formats into Python objects.
+    """
+    try:
+        return resp.json()
+    except Exception:
+        text = (resp.text or "").strip()
+        if not text:
+            return []
+        parsed_rows = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed_rows.append(json.loads(line))
+            except Exception:
+                continue
+        if parsed_rows:
+            return parsed_rows
+        raise
 
 
-def _fetch_rapidapi_instagram_media(shortcode):
-    import requests as req
+def _parse_instagram_shortcode(post_url):
+    cleaned = (post_url or "").strip()
+    if not cleaned:
+        return None
 
-    rapidapi_key = os.environ.get("RAPIDAPI_KEY", "").strip()
-    rapidapi_host = os.environ.get("RAPIDAPI_HOST", "instagram-media-api.p.rapidapi.com").strip()
-    endpoint = os.environ.get(
-        "RAPIDAPI_INSTAGRAM_MEDIA_URL",
-        "https://instagram-media-api.p.rapidapi.com/media/shortcode",
-    ).strip()
+    match = re.search(
+        r"(?:https?://)?(?:www\.)?instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
 
-    if not rapidapi_key:
-        print("[WARNING] RapidAPI key is not configured")
-        return []
+    shortcode = match.group(1)
+    lowered = cleaned.lower()
+    if "/reel/" in lowered:
+        media_path = "reel"
+        media_type = "Instagram Reel"
+    elif "/tv/" in lowered:
+        media_path = "tv"
+        media_type = "Instagram Video"
+    else:
+        media_path = "p"
+        media_type = "Instagram Post"
 
-    if not shortcode:
-        print("[WARNING] RapidAPI shortcode is missing")
-        return []
-
-    print(f"[RAPIDAPI] Starting fetch for shortcode: {shortcode}")
-
-    headers = {
-        "Content-Type": "application/json",
-        "x-rapidapi-key": rapidapi_key,
-        "x-rapidapi-host": rapidapi_host,
+    canonical_url = f"https://www.instagram.com/{media_path}/{shortcode}/"
+    return {
+        "original_url": cleaned,
+        "shortcode": shortcode,
+        "media_path": media_path,
+        "media_type": media_type,
+        "canonical_url": canonical_url,
     }
 
-    request_variants = [
-        {"method": "post", "json": {"shortcode": shortcode, "proxy": ""}},
-        {"method": "post", "json": {"code": shortcode, "proxy": ""}},
-        {"method": "get", "params": {"shortcode": shortcode}},
-        {"method": "get", "params": {"code": shortcode}},
-    ]
 
-    for variant in request_variants:
+def _extract_record_shortcode(record):
+    if not isinstance(record, dict):
+        return ""
+
+    shortcode = (
+        _first_value(
+            record,
+            "shortcode",
+            ("post", "shortcode"),
+            ("node", "shortcode"),
+            ("xdt_shortcode_media", "shortcode"),
+        )
+        or ""
+    ).strip()
+    if shortcode:
+        return shortcode
+
+    candidate_url = str(
+        _first_value(record, "url", "post_url", ("post", "url"), ("node", "url"), ("xdt_shortcode_media", "url"))
+        or ""
+    ).strip()
+    parsed = _parse_instagram_shortcode(candidate_url)
+    return (parsed or {}).get("shortcode", "")
+
+
+def _fetch_brightdata_instagram_post_records(shortcode_items):
+    if not shortcode_items:
+        return {}
+    default_reels_dataset_id = "gd_lk5ns7kz21pck8jpis"
+    default_posts_dataset_id = "gd_lk5ns7kz21pck8jpis"
+
+    reels_dataset_id = (
+        os.environ.get("BRIGHTDATA_INSTAGRAM_REELS_DATASET_ID", "").strip()
+        or os.environ.get("BRIGHTDATA_INSTAGRAM_POST_DATASET_ID", "").strip()
+        or default_reels_dataset_id
+    )
+    posts_dataset_id = (
+        os.environ.get("BRIGHTDATA_INSTAGRAM_POSTS_DATASET_ID", "").strip()
+        or os.environ.get("BRIGHTDATA_INSTAGRAM_POST_DATASET_ID", "").strip()
+        or default_posts_dataset_id
+    )
+
+    groups = {
+        "reel": {"dataset_id": reels_dataset_id, "urls": [], "shortcode_by_url": {}},
+        "post": {"dataset_id": posts_dataset_id, "urls": [], "shortcode_by_url": {}},
+    }
+    seen_urls = set()
+
+    for item in shortcode_items:
+        canonical_url = (item.get("canonical_url") or "").strip()
+        shortcode = (item.get("shortcode") or "").strip().lower()
+        media_path = (item.get("media_path") or "").strip().lower()
+        if not canonical_url or not shortcode:
+            continue
+        normalized_url = canonical_url.rstrip("/").lower()
+        if normalized_url in seen_urls:
+            continue
+        seen_urls.add(normalized_url)
+        group_key = "reel" if media_path in {"reel", "tv"} else "post"
+        groups[group_key]["urls"].append(canonical_url)
+        groups[group_key]["shortcode_by_url"][normalized_url] = shortcode
+
+    records_by_shortcode = {}
+    total_requested = 0
+    total_raw_records = 0
+
+    for group_name, group_payload in groups.items():
+        urls = group_payload["urls"]
+        dataset_id = group_payload["dataset_id"]
+        shortcode_by_url = group_payload["shortcode_by_url"]
+        if not urls:
+            continue
+
+        total_requested += len(urls)
         try:
-            if variant["method"] == "post":
-                print(f"[RAPIDAPI] Trying POST variant for shortcode {shortcode}: {variant['json']}")
-                resp = req.post(endpoint, headers=headers, json=variant["json"], timeout=60)
-                variant_label = f"POST {list(variant['json'].keys())[0]}"
-            else:
-                print(f"[RAPIDAPI] Trying GET variant for shortcode {shortcode}: {variant['params']}")
-                resp = req.get(endpoint, headers=headers, params=variant["params"], timeout=60)
-                variant_label = f"GET {list(variant['params'].keys())[0]}"
-            resp.raise_for_status()
-            payload = resp.json()
-            records = _extract_rapidapi_media_records(payload)
-            if records:
-                print(f"[RAPIDAPI] Instagram media found using {variant_label} for shortcode {shortcode}; extracted records: {len(records)}")
-                return records
+            records = _fetch_brightdata_records(urls, dataset_id)
         except Exception as e:
-            print(f"[WARNING] RapidAPI media fetch failed with {variant}: {e}")
+            print(f"[WARNING] Bright Data {group_name} dataset fetch failed (dataset={dataset_id}): {e}")
+            continue
 
-    return []
+        total_raw_records += len(records)
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+
+            media_node = record.get("xdt_shortcode_media")
+            normalized_record = media_node if isinstance(media_node, dict) else record
+            shortcode = _extract_record_shortcode(normalized_record) or _extract_record_shortcode(record)
+
+            if not shortcode:
+                record_url = str(
+                    _first_value(normalized_record, "url", "post_url", ("post", "url"), ("node", "url"))
+                    or _first_value(record, "url", "post_url", ("post", "url"), ("node", "url"))
+                    or ""
+                ).strip()
+                parsed = _parse_instagram_shortcode(record_url)
+                if parsed and parsed.get("shortcode"):
+                    shortcode = parsed["shortcode"]
+                elif record_url:
+                    shortcode = shortcode_by_url.get(record_url.rstrip("/").lower(), "")
+
+            if not shortcode:
+                continue
+
+            records_by_shortcode.setdefault(shortcode.lower(), []).append(normalized_record)
+
+    print(
+        f"[BRIGHTDATA] Post batch fetch complete | requested={total_requested} "
+        f"| raw_records={total_raw_records} | mapped_shortcodes={len(records_by_shortcode)}"
+    )
+
+    if total_requested and total_raw_records and not records_by_shortcode:
+        print(
+            "[WARNING] Bright Data returned rows but none matched requested shortcodes. "
+            "Likely wrong dataset_id for reels/posts."
+        )
+    return records_by_shortcode
 
 
-def _extract_urls_from_text(value):
+def _extract_urls_from_text(value, dedupe=True):
     if not value:
         return []
     urls = re.findall(r"https?://[^\s,]+", value)
+    if not dedupe:
+        return [url.strip().rstrip(").,]") for url in urls if url.strip().rstrip(").,]")]
     deduped = []
     seen = set()
     for url in urls:
@@ -3720,7 +4066,7 @@ def merge_instagram_post_results(post_results):
 
     merged = {
         "mediaType": "",
-        "source": "rapidapi_shortcode_media_combined",
+        "source": "brightdata_shortcode_media_combined",
         "username": "",
         "fullName": "",
         "brandUsername": "",
@@ -3732,7 +4078,7 @@ def merge_instagram_post_results(post_results):
         "videoUrl": "",
         "postUrls": [],
         "urlResults": [],
-        "raw_data": {"rapidapi_shortcode_media": []},
+        "raw_data": {"brightdata_shortcode_media": []},
         "summary": {
             "postCount": 0,
             "totals": {},
@@ -3768,8 +4114,8 @@ def merge_instagram_post_results(post_results):
         merged["postUrls"].extend(item.get("postUrls") or [])
         if item.get("urlStatus"):
             merged["urlResults"].append(item.get("urlStatus"))
-        raw_item = item.get("raw_data", {}).get("rapidapi_shortcode_media")
-        merged["raw_data"]["rapidapi_shortcode_media"].append(raw_item)
+        raw_item = item.get("raw_data", {}).get("brightdata_shortcode_media")
+        merged["raw_data"]["brightdata_shortcode_media"].append(raw_item)
 
         if item.get("username") and not merged["username"]:
             merged["username"] = item["username"]
@@ -3902,6 +4248,8 @@ def _infer_brand_logo_url_from_post_record(record):
     if not isinstance(record, dict):
         return ""
     candidates = [
+        _first_value(record, "profile_image_link"),
+        _first_value(record, "profile_pic_url"),
         _first_value(record, ("coauthor_producers", 0, "profile_pic_url")),
         _first_value(record, ("edge_media_to_tagged_user", "edges", 0, "node", "user", "profile_pic_url")),
         _first_value(record, "brand_logo_url"),
@@ -3940,7 +4288,7 @@ def _fetch_brightdata_records(urls, dataset_id, max_attempts=12, poll_delay=3):
         timeout=90,
     )
     resp.raise_for_status()
-    payload = resp.json()
+    payload = _parse_brightdata_response(resp)
     records = _extract_brightdata_records(payload)
     if records:
         return records
@@ -3959,7 +4307,7 @@ def _fetch_brightdata_records(urls, dataset_id, max_attempts=12, poll_delay=3):
             timeout=30,
         )
         progress_resp.raise_for_status()
-        progress_data = progress_resp.json()
+        progress_data = _parse_brightdata_response(progress_resp)
         status = progress_data.get("status", "")
         print(f"[BRIGHTDATA] Snapshot status: {status} (attempt {attempt + 1}/{max_attempts})")
 
@@ -3971,7 +4319,7 @@ def _fetch_brightdata_records(urls, dataset_id, max_attempts=12, poll_delay=3):
                 timeout=60,
             )
             snapshot_resp.raise_for_status()
-            return _extract_brightdata_records(snapshot_resp.json())
+            return _extract_brightdata_records(_parse_brightdata_response(snapshot_resp))
 
         if status == "failed":
             print(f"[WARNING] Bright Data snapshot failed for {snapshot_id}")
@@ -3982,23 +4330,24 @@ def _fetch_brightdata_records(urls, dataset_id, max_attempts=12, poll_delay=3):
     return []
 
 
-def fetch_instagram_post_data(post_url):
-    """Fetch exact metrics for a specific Instagram post/Reel from RapidAPI shortcode media endpoint."""
-    import re
+def fetch_instagram_post_data(post_url, prefetched_records_by_shortcode=None):
+    """Fetch metrics for a specific Instagram post/reel from Bright Data."""
     cache_key = ("instagram_post", (post_url or "").strip())
     cached = _cache_get(cache_key)
     if cached is not None:
         print(f"[CACHE] Using cached Instagram post data for: {post_url}")
         return cached
 
-    media_type = "Instagram Reel" if "/reel/" in post_url else "Instagram Post"
-    match = re.search(r'/(?:p|reel|tv)/([A-Za-z0-9_-]+)/?', post_url)
-    if not match:
+    parsed = _parse_instagram_shortcode(post_url)
+    if not parsed:
         print(f"[ERROR] Cannot parse shortcode from: {post_url}")
         return None
 
-    shortcode = match.group(1)
+    shortcode = parsed["shortcode"]
+    canonical_url = parsed["canonical_url"]
+    media_type = parsed["media_type"]
     print(f"[INSTAGRAM] Parsed shortcode {shortcode} from URL: {post_url}")
+
     merged = {
         "mediaType": media_type,
         "source": "",
@@ -4044,44 +4393,42 @@ def fetch_instagram_post_data(post_url):
         if value not in (None, "") and not merged["instagram"].get(key):
             merged["instagram"][key] = str(value)
 
-    # RapidAPI shortcode media endpoint is the source of truth for Instagram post metrics.
-    try:
-        records = _fetch_rapidapi_instagram_media(shortcode)
-    except Exception as e:
-        print(f"[WARNING] RapidAPI media fetch failed: {e}")
-        records = []
+    if prefetched_records_by_shortcode is not None:
+        records = prefetched_records_by_shortcode.get(shortcode.lower(), [])
+    else:
+        records = _fetch_brightdata_instagram_post_records([parsed]).get(shortcode.lower(), [])
 
     for record in records:
         if not isinstance(record, dict):
             continue
 
-        record_shortcode = (
-            _first_value(record, "shortcode", ("post", "shortcode"), ("node", "shortcode"))
-            or ""
-        )
+        record_shortcode = _extract_record_shortcode(record) or ""
         record_url = (
             _first_value(record, "url", "post_url", ("post", "url"), ("node", "url"))
             or ""
         )
-        if record_shortcode and record_shortcode != shortcode:
+        if record_shortcode and record_shortcode.lower() != shortcode.lower():
             continue
-        if record_url and shortcode not in str(record_url):
-            continue
+        if record_url:
+            parsed_record_url = _parse_instagram_shortcode(str(record_url))
+            if parsed_record_url and parsed_record_url.get("shortcode", "").lower() != shortcode.lower():
+                continue
 
         likes = _safe_int(_first_value(record, "like_count", "likes", ("metrics", "likes"), ("statistics", "likes"), ("post", "like_count"), ("node", "like_count"), ("edge_media_preview_like", "count")))
-        comments = _safe_int(_first_value(record, "comment_count", "comments_count", "comments", ("metrics", "comments"), ("statistics", "comments"), ("post", "comment_count"), ("node", "comment_count"), ("edge_media_to_parent_comment", "count"), ("edge_media_preview_comment", "count")))
+        comments = _safe_int(_first_value(record, "comment_count", "comments_count", "comments", "num_comments", ("metrics", "comments"), ("statistics", "comments"), ("post", "comment_count"), ("node", "comment_count"), ("edge_media_to_parent_comment", "count"), ("edge_media_preview_comment", "count")))
         views = _safe_int(_first_value(record, "video_play_count", "play_count", "video_view_count", "view_count", "views", ("metrics", "views"), ("statistics", "views"), ("post", "video_play_count"), ("post", "play_count"), ("post", "video_view_count"), ("node", "video_view_count")))
         shares = _safe_int(_first_value(record, "share_count", "shares", ("metrics", "shares"), ("statistics", "shares"), ("post", "share_count")))
         saves = _safe_int(_first_value(record, "save_count", "saves", ("metrics", "saves"), ("statistics", "saves"), ("post", "save_count")))
-        reach = _safe_int(_first_value(record, "reach", ("owner", "edge_followed_by", "count"), ("user", "follower_count"), ("owner", "follower_count")))
+        reach = _safe_int(_first_value(record, "reach", "followers", ("owner", "edge_followed_by", "count"), ("user", "follower_count"), ("owner", "follower_count")))
         impressions = _safe_int(_first_value(record, "impressions", ("post", "impressions")))
-        username = _first_value(record, ("owner", "username"), ("user", "username"), "username", ("author", "username"), ("post", "owner_username")) or ""
-        full_name = _first_value(record, ("owner", "full_name"), ("user", "full_name"), "full_name", ("author", "full_name"), ("post", "owner_full_name")) or ""
-        engagement_rate = _first_value(record, "engagement_rate", ("metrics", "engagement_rate"), ("post", "engagement_rate")) or ""
-        post_title = _first_value(record, "title", ("post", "title"), ("node", "title")) or ""
+        username = _first_value(record, "user_posted", ("owner", "username"), ("user", "username"), "username", ("author", "username"), ("post", "owner_username")) or ""
+        full_name = _first_value(record, "profile_name", ("owner", "full_name"), ("user", "full_name"), "full_name", ("author", "full_name"), ("post", "owner_full_name")) or ""
+        engagement_rate = _first_value(record, "engagement_rate", "avg_engagement", ("metrics", "engagement_rate"), ("post", "engagement_rate")) or ""
+        post_title = _first_value(record, "title", "description", ("post", "title"), ("node", "title")) or ""
         caption_text = _first_value(
             record,
             "caption",
+            "description",
             ("post", "caption"),
             ("node", "caption"),
             ("edge_media_to_caption", "edges", 0, "node", "text"),
@@ -4093,6 +4440,7 @@ def fetch_instagram_post_data(post_url):
             "display_url",
             "displayUrl",
             "image_url",
+            "thumbnail",
             "thumbnail_src",
             "thumbnail",
             "thumbnail_url",
@@ -4107,6 +4455,7 @@ def fetch_instagram_post_data(post_url):
             ("additional_candidates", "first_frame", "url"),
             ("post", "additional_candidates", "first_frame", "url"),
             ("carousel_media", 0, "image_versions2", "candidates", 0, "url"),
+            ("photos", 0),
         ) or _find_first_media_url(record, "image") or ""
         video_url = _first_value(
             record,
@@ -4142,16 +4491,15 @@ def fetch_instagram_post_data(post_url):
         _fill_post_field("videoUrl", video_url)
         _fill_post_field("postTitle", post_title)
         _fill_post_field("captionText", caption_text)
-        merged["source"] = merged["source"] or "rapidapi_shortcode_media"
-        merged["raw_data"]["rapidapi_shortcode_media"] = record
+        merged["source"] = merged["source"] or "brightdata_shortcode_media"
+        merged["raw_data"]["brightdata_shortcode_media"] = record
         print(
-            f"[OK] RapidAPI post data found for shortcode {shortcode} | "
+            f"[OK] Bright Data post data found for shortcode {shortcode} | "
             f"creator={full_name or username or 'n/a'} | "
             f"likes={likes} | comments={comments} | views={views} | reach={reach}"
         )
         break
 
-    # Compute a lightweight public engagement rate when we have enough public data.
     if not merged["instagram"].get("engagementRate"):
         try:
             views = _safe_int(merged["instagram"].get("views"))
@@ -4186,11 +4534,37 @@ def fetch_instagram_post_data(post_url):
     }
     print(f"[INSTAGRAM] URL status for {shortcode}: {merged['urlStatus']}")
     if not has_metrics and not has_metadata:
-        print("[WARNING] No usable Instagram post metrics or metadata returned from RapidAPI")
+        print(f"[WARNING] No usable Instagram post metrics or metadata returned from Bright Data for {canonical_url}")
         return None
 
     _cache_set(cache_key, merged)
     return merged
+
+
+def fetch_instagram_posts_batch(post_urls):
+    parsed_items = []
+    invalid_urls = []
+    for url in post_urls:
+        parsed = _parse_instagram_shortcode(url)
+        if parsed:
+            parsed_items.append(parsed)
+        else:
+            invalid_urls.append(url)
+
+    if not parsed_items:
+        return {"results": [], "invalid_urls": invalid_urls}
+
+    prefetched_records_by_shortcode = _fetch_brightdata_instagram_post_records(parsed_items)
+    results = []
+    for parsed in parsed_items:
+        item = fetch_instagram_post_data(
+            parsed.get("original_url"),
+            prefetched_records_by_shortcode=prefetched_records_by_shortcode,
+        )
+        if item:
+            results.append(item)
+
+    return {"results": results, "invalid_urls": invalid_urls}
 
 
 def fetch_instagram_data(username):
@@ -4204,7 +4578,11 @@ def fetch_instagram_data(username):
         print(f"[CACHE] Using cached Instagram profile data for: @{username}")
         return cached
 
-    dataset_id = os.environ.get("BRIGHTDATA_INSTAGRAM_PROFILE_DATASET_ID", "gd_l1vikfch901nx3by4").strip()
+    dataset_id = (
+        os.environ.get("BRIGHTDATA_INSTAGRAM_PROFILE_DATASET_ID", "").strip()
+        or os.environ.get("BRIGHTDATA_INSTAGRAM_DATASET_ID", "").strip()
+        or "gd_l1vikfch901nx3by4"
+    )
     profile_url = f"https://www.instagram.com/{username}/"
 
     try:
